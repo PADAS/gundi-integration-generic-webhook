@@ -18,7 +18,7 @@ async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook
         input_data = [json.loads(i.json()) for i in payload]
     else:
         input_data = json.loads(payload.json())
-    filter_expression = webhook_config.jq_filter.replace("\n", ""). replace(" ", "")
+    filter_expression = webhook_config.jq_filter.replace("\n", "")
     transformed_data = pyjq.all(filter_expression, input_data)
     logger.info(f"Transformed Data: {transformed_data}")
     if webhook_config.output_type == "obv":  # ToDo: Use an enum?
