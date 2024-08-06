@@ -23,10 +23,13 @@ jobs:
           echo "tf_file_dev=environments/dev/integrations/${{ github.event.repository.name }}/terragrunt.hcl" >> $GITHUB_OUTPUT
           echo "tf_file_stage=environments/stage/integrations/${{ github.event.repository.name }}/terragrunt.hcl" >> $GITHUB_OUTPUT
           echo "tf_file_prod=environments/prod/integrations/${{ github.event.repository.name }}/terragrunt.hcl" >> $GITHUB_OUTPUT
-  
+
+  run_unit_tests:
+    uses: ./.github/workflows/_tests.yml
+
   build:
     uses: PADAS/gundi-workflows/.github/workflows/build_docker.yml@v2
-    needs: vars
+    needs: [run_unit_tests, vars]
     with:
       repository: ${{ needs.vars.outputs.repository }}
       tag: ${{ needs.vars.outputs.tag }}
@@ -71,4 +74,3 @@ jobs:
       environment: prod
     secrets:
       ssh-key: ${{ secrets.GUNDI_INTEGRATIONS_DEPLOY_KEY }}
-
