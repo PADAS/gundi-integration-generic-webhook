@@ -21,18 +21,28 @@ async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook
     filter_expression = webhook_config.jq_filter.replace("\n", "")
     transformed_data = pyjq.all(filter_expression, input_data)
     logger.info(f"Transformed Data: {transformed_data}")
-    if webhook_config.output_type == "obv":  # ToDo: Use an enum?
-        response = await send_observations_to_gundi(
-            observations=transformed_data,
-            integration_id=integration.id
-        )
-    elif webhook_config.output_type == "ev":
-        response = await send_events_to_gundi(
-            events=transformed_data,
-            integration_id=integration.id
-        )
+    # Check if a filter is present in the filtered data
+    for data in transformed_data:
+        status = data.get("status", "OK")
+        if status != "OK":
+            logger.info(f"'{data}' point received was filtered")
+            transformed_data.remove(data)
+    if transformed_data:
+        if webhook_config.output_type == "obv":  # ToDo: Use an enum?
+            response = await send_observations_to_gundi(
+                observations=transformed_data,
+                integration_id=integration.id
+            )
+        elif webhook_config.output_type == "ev":
+            response = await send_events_to_gundi(
+                events=transformed_data,
+                integration_id=integration.id
+            )
+        else:
+            raise ValueError(f"Invalid output type: {webhook_config.output_type}. Please review the configuration.")
+        data_points_qty = len(response)
+        logger.info(f"'{data_points_qty}' data point(s) sent to Gundi.")
+        return {"data_points_qty": data_points_qty}
     else:
-        raise ValueError(f"Invalid output type: {webhook_config.output_type}. Please review the configuration.")
-    data_points_qty = len(response)
-    logger.info(f"'{data_points_qty}' data point(s) sent to Gundi.")
-    return {"data_points_qty": data_points_qty}
+        logger.info(f"No data point(s) sent to Gundi.")
+        return {"data_points_qty": 0}
