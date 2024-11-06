@@ -23,21 +23,31 @@ async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook
     logger.info(f"Transformed Data: {transformed_data}")
     # Check if a filter is present in the filtered data
     for data in transformed_data:
-        status = data.get("status", "OK")
-        if status != "OK":
+        if data.get("status", "OK") != 'OK':
             logger.info(f"'{data}' point received was filtered")
             transformed_data.remove(data)
     if transformed_data:
         if webhook_config.output_type == "obv":  # ToDo: Use an enum?
-            response = await send_observations_to_gundi(
-                observations=transformed_data,
-                integration_id=integration.id
-            )
+
+            try:
+                response = await send_observations_to_gundi(
+                    observations=transformed_data,
+                    integration_id=integration.id
+                )
+            except Exception as e:
+                logger.exception(f"Failed sending Observations. payload: {payload}, transformed_data: {transformed_data}, error: {e}")
+                raise
+
         elif webhook_config.output_type == "ev":
-            response = await send_events_to_gundi(
-                events=transformed_data,
-                integration_id=integration.id
-            )
+            try:
+                response = await send_events_to_gundi(
+                    events=transformed_data,
+                    integration_id=integration.id
+                )
+            except Exception as e:
+                logger.exception(f"Failed sending Events. payload: {payload}, transformed_data: {transformed_data}, error: {e}")
+                raise
+
         else:
             raise ValueError(f"Invalid output type: {webhook_config.output_type}. Please review the configuration.")
         data_points_qty = len(response)
