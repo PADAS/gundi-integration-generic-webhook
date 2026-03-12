@@ -1,8 +1,9 @@
 import json
 import pyjq
 import logging
+from gundi_core.schemas.v2 import LogLevel
 from app.services.gundi import send_observations_to_gundi, send_events_to_gundi
-from app.services.activity_logger import webhook_activity_logger
+from app.services.activity_logger import webhook_activity_logger, log_webhook_activity
 from .core import GenericJsonPayload,  GenericJsonTransformConfig
 
 
@@ -24,7 +25,14 @@ async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook
     # Check if a filter is present in the filtered data
     for data in transformed_data:
         if data.get("status", "OK") != 'OK':
-            logger.info(f"'{data}' point received was filtered")
+            logger.warning(f"'{data}' point received was filtered")
+            await log_webhook_activity(
+                integration_id=integration.id,
+                webhook_id=integration.webhook_configuration.id,
+                level=LogLevel.WARNING,
+                title="Invalid observation filtered",
+                data={"payload": input_data, "transformed_data": data}
+            )
             transformed_data.remove(data)
     if transformed_data:
         if webhook_config.output_type == "obv":  # ToDo: Use an enum?
