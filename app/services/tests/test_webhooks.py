@@ -67,6 +67,36 @@ async def test_process_webhook_request_with_dynamic_schema(
     )
 
 
+@pytest.mark.asyncio
+async def test_process_webhook_dynamic_schema_parse_error_is_diagnosable(
+        mocker, integration_v2_with_webhook_generic, mock_publish_event,
+        mock_get_webhook_handler_for_generic_json_payload, mock_webhook_handler,
+        mock_webhook_request_headers_onyesha
+):
+    mocker.patch("app.services.webhooks.get_webhook_handler", mock_get_webhook_handler_for_generic_json_payload)
+    mocker.patch("app.services.config_manager.IntegrationConfigurationManager.get_integration_details", AsyncMock(return_value=integration_v2_with_webhook_generic))
+    mocker.patch("app.services.webhooks.publish_event", mock_publish_event)
+    # `received_at` is typed as a string in the integration's json_schema; sending
+    # an object for it triggers exactly one validation error on the dynamic model.
+    bad_payload = {"received_at": {"unexpected": "object"}}
+
+    response = api_client.post(
+        "/webhooks",
+        headers=mock_webhook_request_headers_onyesha,
+        json=bad_payload,
+    )
+
+    assert response.status_code == 200
+    mock_publish_event.assert_called_once()
+    error = mock_publish_event.call_args.kwargs["event"].payload.error
+    # The error must identify which integration failed...
+    assert str(integration_v2_with_webhook_generic.id) in error
+    # ...name the offending field...
+    assert "received_at" in error
+    # ...and be a single greppable line (Cloud Run splits stdout on newlines).
+    assert "\n" not in error
+
+
 # TTL Configuration Tests
 
 @pytest.mark.asyncio

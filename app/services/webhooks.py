@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import httpx
 import stamina
 from fastapi import Request
+from pydantic import ValidationError
 from app import settings
 from app.services.activity_logger import log_activity, publish_event
 from gundi_client_v2 import GundiClient
@@ -19,6 +20,21 @@ from app.services.config_manager import IntegrationConfigurationManager
 config_manager = IntegrationConfigurationManager()
 logger = logging.getLogger(__name__)
 _diagnostic_client: httpx.AsyncClient | None = None
+
+
+def _summarize_payload_error(e: Exception) -> str:
+    """Render a payload parse error as a single, greppable line.
+
+    Pydantic ValidationErrors are multi-line by default, which Cloud Run splits
+    into separate log entries — losing the field detail from the summary line.
+    Flatten them to one line that names each offending field, message, and type.
+    """
+    if isinstance(e, ValidationError):
+        return "; ".join(
+            f"{'.'.join(str(loc) for loc in err['loc'])}: {err['msg']} ({err['type']})"
+            for err in e.errors()
+        )
+    return " ".join(str(e).split())
 
 
 def _get_diagnostic_client() -> httpx.AsyncClient:
@@ -187,13 +203,20 @@ async def process_webhook(request: Request):
                 else:
                     parsed_payload = payload_model.parse_obj(json_content)
             except Exception as e:
-                message = f"Error parsing payload: {type(e).__name__}: {str(e)}. Please review configurations."
+                webhook = getattr(integration.type, "webhook", None)
+                webhook_value = webhook.value if webhook else None
+                message = (
+                    f"Error parsing payload for integration '{integration.id}' "
+                    f"(webhook '{webhook_value}'): "
+                    f"{type(e).__name__}: {_summarize_payload_error(e)}. "
+                    f"Please review configurations."
+                )
                 logger.exception(message)
                 await publish_event(
                     event=IntegrationWebhookFailed(
                         payload=WebhookExecutionFailed(
                             integration_id=str(integration.id),
-                            webhook_id=str(integration.type.webhook.value),
+                            webhook_id=str(webhook_value) if webhook_value is not None else None,
                             config_data=webhook_config_data,
                             error=message
                         )
