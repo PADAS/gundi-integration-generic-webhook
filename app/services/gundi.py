@@ -1,11 +1,18 @@
 import datetime
 from typing import List
+import anyio
 import httpx
 import stamina
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 
+# Transient transport failures worth retrying. anyio.EndOfStream shows up when a
+# connection (often the TLS handshake) is dropped mid-flight; httpcore 0.17.x
+# doesn't map it to httpx.ConnectError, so it would otherwise escape the
+# httpx.HTTPError retry net. See GUNDI-5423 (fix) and GUNDI-5424 (httpcore upgrade).
+RETRYABLE_SEND_ERRORS = (httpx.HTTPError, anyio.EndOfStream)
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+
+@stamina.retry(on=RETRYABLE_SEND_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def _get_gundi_api_key(integration_id):
     async with GundiClient() as gundi_client:
         return await gundi_client.get_integration_api_key(
@@ -22,7 +29,7 @@ async def _get_sensors_api_client(integration_id):
     return sensors_api_client
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+@stamina.retry(on=RETRYABLE_SEND_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     """
     Send Events to Gundi using the REST API v2
@@ -51,7 +58,7 @@ async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     return await sensors_api_client.post_events(data=events)
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+@stamina.retry(on=RETRYABLE_SEND_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_event_attachments_to_gundi(event_id: str, attachments: List[tuple], **kwargs) -> dict:
     """
     Send Event Attachments to Gundi using the REST API v2
@@ -69,7 +76,7 @@ async def send_event_attachments_to_gundi(event_id: str, attachments: List[tuple
     return await sensors_api_client.post_event_attachments(event_id=event_id, attachments=attachments)
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+@stamina.retry(on=RETRYABLE_SEND_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_observations_to_gundi(observations: List[dict], **kwargs) -> dict:
     """
     Send Observations to Gundi using the REST API v2
@@ -99,7 +106,7 @@ async def send_observations_to_gundi(observations: List[dict], **kwargs) -> dict
     return await sensors_api_client.post_observations(data=observations)
 
 
-@stamina.retry(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
+@stamina.retry(on=RETRYABLE_SEND_ERRORS, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0)
 async def send_messages_to_gundi(messages: List[dict], **kwargs) -> dict:
     """
     Send Messages to Gundi using the REST API v2

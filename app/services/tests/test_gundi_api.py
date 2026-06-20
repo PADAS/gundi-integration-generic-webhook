@@ -1,3 +1,4 @@
+import anyio
 import pytest
 from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi
 
@@ -121,3 +122,40 @@ async def test_send_observations_to_gundi(
     assert len(response) == 2
     assert mock_gundi_sensors_client_class.called
     mock_gundi_sensors_client_class.return_value.post_observations.assert_called_once_with(data=observations)
+
+
+@pytest.mark.asyncio
+async def test_send_observations_to_gundi_retries_on_end_of_stream(
+        mocker, mock_gundi_client_v2_class, mock_gundi_sensors_client_class,
+        mock_get_gundi_api_key, integration_v2, observations_created_response
+):
+    # Avoid real backoff waits during the retry
+    mocker.patch("asyncio.sleep", new_callable=mocker.AsyncMock)
+    mocker.patch("app.services.gundi.GundiClient", mock_gundi_client_v2_class)
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    # The TLS handshake to the Sensors API occasionally drops mid-connection,
+    # surfacing as a bare anyio.EndOfStream (httpcore 0.17.3 doesn't map it to
+    # httpx.ConnectError). The send must retry through it, like any other
+    # transient transport failure.
+    mock_gundi_sensors_client_class.return_value.post_observations = mocker.AsyncMock(
+        side_effect=[anyio.EndOfStream(), observations_created_response]
+    )
+    observations = [
+        {
+            "source": "device-xy123",
+            "type": "tracking-device",
+            "subject_type": "puma",
+            "recorded_at": "2024-01-24 09:03:00-0300",
+            "location": {"lat": -51.748, "lon": -72.720},
+            "additional": {"speed_kmph": 5}
+        }
+    ]
+
+    response = await send_observations_to_gundi(
+        observations=observations,
+        integration_id=integration_v2.id
+    )
+
+    assert response == observations_created_response
+    assert mock_gundi_sensors_client_class.return_value.post_observations.call_count == 2
