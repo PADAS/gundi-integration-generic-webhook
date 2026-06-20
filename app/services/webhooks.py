@@ -203,9 +203,11 @@ async def process_webhook(request: Request):
                 else:
                     parsed_payload = payload_model.parse_obj(json_content)
             except Exception as e:
+                webhook = getattr(integration.type, "webhook", None)
+                webhook_value = webhook.value if webhook else None
                 message = (
                     f"Error parsing payload for integration '{integration.id}' "
-                    f"(webhook '{integration.type.webhook.value}'): "
+                    f"(webhook '{webhook_value}'): "
                     f"{type(e).__name__}: {_summarize_payload_error(e)}. "
                     f"Please review configurations."
                 )
@@ -214,7 +216,7 @@ async def process_webhook(request: Request):
                     event=IntegrationWebhookFailed(
                         payload=WebhookExecutionFailed(
                             integration_id=str(integration.id),
-                            webhook_id=str(integration.type.webhook.value),
+                            webhook_id=str(webhook_value) if webhook_value is not None else None,
                             config_data=webhook_config_data,
                             error=message
                         )
