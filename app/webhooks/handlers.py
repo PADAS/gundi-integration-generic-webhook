@@ -3,14 +3,15 @@ import pyjq
 import logging
 from app.services.gundi import send_observations_to_gundi, send_events_to_gundi
 from app.services.activity_logger import webhook_activity_logger
-from .core import GenericJsonPayload,  GenericJsonTransformConfig
+from .core import GenericJsonPayload
+from .configurations import GenericWebhookTransformConfig
 
 
 logger = logging.getLogger(__name__)
 
 
 @webhook_activity_logger()
-async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook_config: GenericJsonTransformConfig = None):
+async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook_config: GenericWebhookTransformConfig = None):
     logger.info(f"Webhook handler executed with integration: '{integration}'.")
     logger.info(f"Payload: '{payload}'.")
     logger.info(f"Config: '{webhook_config}'.")

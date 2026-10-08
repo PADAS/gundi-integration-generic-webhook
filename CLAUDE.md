@@ -77,6 +77,10 @@ API docs available at http://localhost:8080/docs
 | `app/services/gundi.py` | Sends observations/events to Gundi API |
 | `app/services/activity_logger.py` | `@activity_logger()` / `@webhook_activity_logger()` decorators + `log_activity()` |
 | `app/services/config_manager.py` | Fetches and caches integration config from Gundi (Redis-backed, 60s TTL) |
+| `app/services/errors.py` | Error classification: `IntegrationError`, `CONNECTIVITY_EXCEPTIONS`, `source_status_code()` |
+| `app/services/retry_policies.py` | Shared stamina retry predicates (`is_transient_gundi_error`, `is_retryable_failure`, `REDIS_RETRY`) |
+| `app/services/redaction.py` | Redacts secrets from configs and request/response data attached to activity-log events |
+| `app/services/url_policy.py` | `validate_outbound_url()`: https-only, allowlist, and SSRF (private/reserved address) checks |
 | `app/services/utils.py` | `FieldWithUIOptions`, `UIOptions`, `GlobalUISchemaOptions`, `StructHexString`, `DyntamicFactory` |
 | `app/settings/base.py` | All env-var-driven settings |
 | `app/conftest.py` | Shared pytest fixtures for the entire test suite |

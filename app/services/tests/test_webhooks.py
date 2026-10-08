@@ -258,8 +258,12 @@ async def test_process_webhook_handles_no_integration_gracefully(
     mock_logger.warning.assert_called_once()
     warning_call = mock_logger.warning.call_args[0][0]
     assert "No integration found for webhook request" in warning_call
-    assert "headers:" in warning_call
-    assert "query_params:" in warning_call
+    assert "consumer_username:" in warning_call
+    assert "integration_id header:" in warning_call
+    assert "integration_id param:" in warning_call
+    # Upstream stopped dumping raw headers/query params into the log (they can carry credentials).
+    assert "headers:" not in warning_call
+    assert "query_params:" not in warning_call
 
 
 @pytest.mark.asyncio
@@ -439,7 +443,7 @@ async def test_diagnostic_forwarding_called_when_url_configured(
         "app.services.webhooks.forward_payload_to_diagnostic_url",
         return_value=AsyncMock(),
     )
-    mocker.patch("app.services.webhooks.asyncio.ensure_future", side_effect=lambda coro: coro.close())
+    mocker.patch("app.services.webhooks._spawn_background_task", side_effect=lambda coro: coro.close())
 
     response = api_client.post(
         "/webhooks",
@@ -565,9 +569,9 @@ def _make_getaddrinfo(ip: str):
 @pytest.mark.asyncio
 async def test_validate_diagnostic_url_accepts_public_https(mocker):
     from app.services.webhooks import _validate_diagnostic_url
-    mock_loop = MagicMock()
-    mock_loop.getaddrinfo = _make_getaddrinfo("203.0.113.5")  # TEST-NET-3 (RFC 5737), not in blocked list
-    mocker.patch("app.services.webhooks.asyncio.get_running_loop", return_value=mock_loop)
+    # A genuinely global address: url_policy rejects anything that is not ip.is_global,
+    # which includes the RFC 5737 documentation ranges.
+    mocker.patch("app.services.url_policy._resolve_addresses", AsyncMock(return_value=["93.184.216.34"]))
     await _validate_diagnostic_url("https://diagnostics.example.com/dump")  # should not raise
 
 
@@ -631,9 +635,7 @@ async def test_validate_diagnostic_url_enforces_allowlist(mocker):
 async def test_validate_diagnostic_url_passes_allowlist(mocker):
     from app.services.webhooks import _validate_diagnostic_url
     mocker.patch("app.services.webhooks.settings.DIAGNOSTIC_URL_ALLOWLIST", ["allowed.example.com"])
-    mock_loop = MagicMock()
-    mock_loop.getaddrinfo = _make_getaddrinfo("203.0.113.5")
-    mocker.patch("app.services.webhooks.asyncio.get_running_loop", return_value=mock_loop)
+    mocker.patch("app.services.url_policy._resolve_addresses", AsyncMock(return_value=["93.184.216.34"]))
     await _validate_diagnostic_url("https://allowed.example.com/dump")  # should not raise
 
 
@@ -713,7 +715,9 @@ async def test_forward_payload_to_diagnostic_url_handles_http_error(mocker):
 
     mock_logger.warning.assert_called_once()
     warning_msg = mock_logger.warning.call_args[0][0]
-    assert destination_url in warning_msg
+    # Only the host is logged; the full URL (path/query may carry tokens) must stay out.
+    assert "diagnostics.example.com" in warning_msg
+    assert destination_url not in warning_msg
     assert integration_id in warning_msg
 
 
@@ -840,3 +844,19 @@ async def test_handler_raises_when_no_output_type_resolved(
     payload.json.return_value = "{}"
     with pytest.raises(ValueError, match="No output type for record"):
         await webhook_handler(payload=payload, integration=mock_integration_for_handler, webhook_config=config_no_type)
+
+
+def test_fork_webhook_config_documents_per_record_output_type_override():
+    """The handler lets each record pick its type via '__gundi_output_type'; the
+    portal help text must say so. The template model (GenericJsonTransformConfig)
+    describes output_type as applying to every record, so this integration's own
+    config model carries the override-aware description instead."""
+    import inspect
+    from app.webhooks.configurations import GenericWebhookTransformConfig
+    from app.webhooks.core import GenericJsonTransformConfig
+    from app.webhooks.handlers import webhook_handler
+
+    assert inspect.signature(webhook_handler).parameters["webhook_config"].annotation is GenericWebhookTransformConfig
+    assert issubclass(GenericWebhookTransformConfig, GenericJsonTransformConfig)
+    description = GenericWebhookTransformConfig.schema()["properties"]["output_type"]["description"]
+    assert "__gundi_output_type" in description
