@@ -258,8 +258,12 @@ async def test_process_webhook_handles_no_integration_gracefully(
     mock_logger.warning.assert_called_once()
     warning_call = mock_logger.warning.call_args[0][0]
     assert "No integration found for webhook request" in warning_call
-    assert "headers:" in warning_call
-    assert "query_params:" in warning_call
+    assert "consumer_username:" in warning_call
+    assert "integration_id header:" in warning_call
+    assert "integration_id param:" in warning_call
+    # Upstream stopped dumping raw headers/query params into the log (they can carry credentials).
+    assert "headers:" not in warning_call
+    assert "query_params:" not in warning_call
 
 
 @pytest.mark.asyncio
@@ -439,7 +443,7 @@ async def test_diagnostic_forwarding_called_when_url_configured(
         "app.services.webhooks.forward_payload_to_diagnostic_url",
         return_value=AsyncMock(),
     )
-    mocker.patch("app.services.webhooks.asyncio.ensure_future", side_effect=lambda coro: coro.close())
+    mocker.patch("app.services.webhooks._spawn_background_task", side_effect=lambda coro: coro.close())
 
     response = api_client.post(
         "/webhooks",
@@ -565,9 +569,9 @@ def _make_getaddrinfo(ip: str):
 @pytest.mark.asyncio
 async def test_validate_diagnostic_url_accepts_public_https(mocker):
     from app.services.webhooks import _validate_diagnostic_url
-    mock_loop = MagicMock()
-    mock_loop.getaddrinfo = _make_getaddrinfo("203.0.113.5")  # TEST-NET-3 (RFC 5737), not in blocked list
-    mocker.patch("app.services.webhooks.asyncio.get_running_loop", return_value=mock_loop)
+    # A genuinely global address: url_policy rejects anything that is not ip.is_global,
+    # which includes the RFC 5737 documentation ranges.
+    mocker.patch("app.services.url_policy._resolve_addresses", AsyncMock(return_value=["93.184.216.34"]))
     await _validate_diagnostic_url("https://diagnostics.example.com/dump")  # should not raise
 
 
@@ -631,9 +635,7 @@ async def test_validate_diagnostic_url_enforces_allowlist(mocker):
 async def test_validate_diagnostic_url_passes_allowlist(mocker):
     from app.services.webhooks import _validate_diagnostic_url
     mocker.patch("app.services.webhooks.settings.DIAGNOSTIC_URL_ALLOWLIST", ["allowed.example.com"])
-    mock_loop = MagicMock()
-    mock_loop.getaddrinfo = _make_getaddrinfo("203.0.113.5")
-    mocker.patch("app.services.webhooks.asyncio.get_running_loop", return_value=mock_loop)
+    mocker.patch("app.services.url_policy._resolve_addresses", AsyncMock(return_value=["93.184.216.34"]))
     await _validate_diagnostic_url("https://allowed.example.com/dump")  # should not raise
 
 
@@ -713,7 +715,9 @@ async def test_forward_payload_to_diagnostic_url_handles_http_error(mocker):
 
     mock_logger.warning.assert_called_once()
     warning_msg = mock_logger.warning.call_args[0][0]
-    assert destination_url in warning_msg
+    # Only the host is logged; the full URL (path/query may carry tokens) must stay out.
+    assert "diagnostics.example.com" in warning_msg
+    assert destination_url not in warning_msg
     assert integration_id in warning_msg
 
 
