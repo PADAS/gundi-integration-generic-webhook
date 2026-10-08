@@ -844,3 +844,19 @@ async def test_handler_raises_when_no_output_type_resolved(
     payload.json.return_value = "{}"
     with pytest.raises(ValueError, match="No output type for record"):
         await webhook_handler(payload=payload, integration=mock_integration_for_handler, webhook_config=config_no_type)
+
+
+def test_fork_webhook_config_documents_per_record_output_type_override():
+    """The handler lets each record pick its type via '__gundi_output_type'; the
+    portal help text must say so. The template model (GenericJsonTransformConfig)
+    describes output_type as applying to every record, so this integration's own
+    config model carries the override-aware description instead."""
+    import inspect
+    from app.webhooks.configurations import GenericWebhookTransformConfig
+    from app.webhooks.core import GenericJsonTransformConfig
+    from app.webhooks.handlers import webhook_handler
+
+    assert inspect.signature(webhook_handler).parameters["webhook_config"].annotation is GenericWebhookTransformConfig
+    assert issubclass(GenericWebhookTransformConfig, GenericJsonTransformConfig)
+    description = GenericWebhookTransformConfig.schema()["properties"]["output_type"]["description"]
+    assert "__gundi_output_type" in description
