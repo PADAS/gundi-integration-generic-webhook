@@ -1,8 +1,8 @@
 import json
-import pyjq
 import logging
 from app.services.gundi import send_observations_to_gundi, send_events_to_gundi
 from app.services.activity_logger import webhook_activity_logger
+from app.services.jq_transform import jq_all
 from .core import GenericJsonPayload
 from .configurations import GenericWebhookTransformConfig
 
@@ -19,8 +19,7 @@ async def webhook_handler(payload: GenericJsonPayload, integration=None, webhook
         input_data = [json.loads(i.json()) for i in payload]
     else:
         input_data = json.loads(payload.json())
-    filter_expression = webhook_config.jq_filter.replace("\n", "")
-    transformed_data = pyjq.all(filter_expression, input_data)
+    transformed_data = jq_all(webhook_config.jq_filter, input_data)
     logger.info(f"Transformed Data: {transformed_data}")
     if transformed_data:
         groups = {}

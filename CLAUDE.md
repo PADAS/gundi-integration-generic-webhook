@@ -72,6 +72,11 @@ API docs available at http://localhost:8080/docs
 | `app/webhooks/core.py` | Base classes: `WebhookPayload`, `WebhookConfiguration`, `GenericJsonTransformConfig`, `DynamicSchemaConfig`, `HexStringConfig` |
 | `app/actions/handlers.py` | Pull/push action handlers |
 | `app/actions/configurations.py` | Action configuration models |
+| `app/actions/client.py` | Pure HTTP client for outbound webhook endpoints (no Gundi imports) |
+| `app/actions/envelopes.py` | `GundiBatchDelivery` bundle envelope (local until it moves to gundi-core) |
+| `app/services/jq_transform.py` | JQ helpers shared by the inbound webhook and outbound deliver actions |
+| `app/services/outbound_buffer.py` | Redis buffers + locked flush for outbound batch mode |
+| `app/services/batch_progress.py` | Per-bundle redelivery dedup records (ported from the ER dispatcher) |
 | `app/services/webhooks.py` | Orchestrates webhook processing, payload parsing, error publishing |
 | `app/services/action_runner.py` | Orchestrates action execution |
 | `app/services/gundi.py` | Sends observations/events to Gundi API |

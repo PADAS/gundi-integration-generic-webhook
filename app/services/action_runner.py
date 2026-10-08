@@ -24,6 +24,7 @@ from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, Lo
 
 from app.actions.core import (
     AuthActionConfiguration, InternalActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration,
+    StoredConfigOptionalMixin,
 )
 from app.api_schemas import IntegrationState
 from .config_manager import IntegrationConfigurationManager
@@ -580,7 +581,10 @@ async def _execute_action_impl(
     is_internal_action = isinstance(config_model, type) and issubclass(
         config_model, InternalActionConfiguration
     )
-    skip_missing_config = is_ephemeral or is_reference_action or is_internal_action
+    # Opt-in (StoredConfigOptionalMixin): the row is still looked up below and
+    # wins when present; without one the model's defaults are used.
+    is_config_optional = isinstance(config_model, type) and issubclass(config_model, StoredConfigOptionalMixin)
+    skip_missing_config = is_ephemeral or is_reference_action or is_internal_action or is_config_optional
 
     # Get the configuration needed to execute the action
     if is_ephemeral:
