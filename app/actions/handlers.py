@@ -14,7 +14,7 @@ from gundi_core.schemas.v2 import Integration, LogLevel
 
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger, log_action_activity
-from app.services.batch_progress import BatchProgressStore, decode, fingerprint
+from app.services.batch_progress import BatchProgressStore, decode, fingerprint, headers_digest
 from app.services.errors import (
     IntegrationAuthError,
     IntegrationBadResponseError,
@@ -47,10 +47,6 @@ outbound_buffer = OutboundBuffer()
 batch_progress = BatchProgressStore()
 state_manager = IntegrationStateManager()
 
-# flush_buffers runs every minute; an invalid deliver config is reported at most this often.
-INVALID_CONFIG_WARNING_THROTTLE_SECONDS = 3600
-# A full buffer drops a record per incoming record; the drops are reported at most this often.
-BUFFER_OVERFLOW_REPORT_SECONDS = 600
 
 _OUTPUT_TYPES_BY_PAYLOAD = {
     schemas.v2.Observation: OutputType.OBSERVATION,
@@ -299,7 +295,7 @@ async def _drop_buffer(integration: Integration, action_id: str, output_type: Ou
 
 async def _report_buffer_overflow(integration: Integration, action_id: str, output_type: OutputType):
     """ERROR for records the buffer cap dropped, at most once per
-    BUFFER_OVERFLOW_REPORT_SECONDS, with the count since the last report.
+    OUTBOUND_OVERFLOW_REPORT_SECONDS, with the count since the last report.
     Never raises."""
     integration_id = str(integration.id)
     try:
@@ -308,7 +304,8 @@ async def _report_buffer_overflow(integration: Integration, action_id: str, outp
         try:
             first_in_window = await state_manager.set_if_absent(
                 integration_id=integration_id, action_id="deliver",
-                source_id=f"buffer-overflow-{output_type.value}", ttl_seconds=BUFFER_OVERFLOW_REPORT_SECONDS,
+                source_id=f"buffer-overflow-{output_type.value}",
+                ttl_seconds=settings.OUTBOUND_OVERFLOW_REPORT_SECONDS,
             )
         except Exception:
             first_in_window = True  # surface it rather than hide it when the throttle is unavailable
@@ -380,6 +377,19 @@ async def action_deliver(
     return {"delivered": sent, "output_type": output_type.value}
 
 
+def _request_plan(integration: Integration, endpoint: EndpointSettings) -> list:
+    """What a bundle's requests depend on besides its records, for the progress
+    fingerprint: any change to it re-sends requests recorded as settled."""
+    try:
+        auth = headers_digest(build_headers(_get_auth_config(integration)))
+    except IntegrationConfigurationError:
+        auth = b"invalid"  # every send fails the same way until it is fixed
+    return [
+        endpoint.url, endpoint.method.value, endpoint.jq_filter,
+        "batch" if endpoint.batch_mode else "single", auth,
+    ]
+
+
 async def _deliver_bundle_group(
         integration: Integration, batch_id, endpoint: EndpointSettings, records: List[dict],
 ) -> dict:
@@ -389,9 +399,10 @@ async def _deliver_bundle_group(
     chunk_size = endpoint.max_batch_size if endpoint.batch_mode else 1
     chunks = list(generate_batches(records, chunk_size))
     progress_args = (batch_id, str(integration.id), endpoint.output_type.value)
-    fp = fingerprint(_gundi_ids(records), chunk_size)
+    fp = fingerprint(_gundi_ids(records), chunk_size, _request_plan(integration, endpoint))
     # A bit is set once its request is settled: delivered, or permanently
-    # rejected and logged. Either way a redelivered bundle must not send it again.
+    # rejected and logged. Either way a redelivered bundle with the same request
+    # plan must not send it again.
     settled = decode(await batch_progress.read(*progress_args), fp, len(chunks))
     result = {"requests": len(chunks), "already_settled": len(settled), "sent": 0, "skipped_by_filter": 0, "failed": 0}
     for index, chunk in enumerate(chunks):
@@ -470,7 +481,7 @@ async def _warn_invalid_deliver_config(integration: Integration, error: Integrat
     try:
         first_in_window = await state_manager.set_if_absent(
             integration_id=str(integration.id), action_id="flush_buffers",
-            source_id="invalid-deliver-config-warning", ttl_seconds=INVALID_CONFIG_WARNING_THROTTLE_SECONDS,
+            source_id="invalid-deliver-config-warning", ttl_seconds=settings.OUTBOUND_INVALID_CONFIG_WARNING_SECONDS,
         )
     except Exception:
         first_in_window = True  # surface it rather than hide it when the throttle is unavailable

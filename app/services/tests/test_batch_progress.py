@@ -1,7 +1,7 @@
 import pytest
 
 from app.services import batch_progress
-from app.services.batch_progress import BatchProgressStore, decode, encode, fingerprint
+from app.services.batch_progress import BatchProgressStore, decode, encode, fingerprint, headers_digest
 from app.services.tests.fake_redis import FakeRedis
 
 
@@ -14,6 +14,27 @@ def test_fingerprint_binds_order_and_chunk_size():
     assert fingerprint(["a", "b"], 10) != fingerprint(["b", "a"], 10)
     # Same items chunked differently: bit i no longer names the same request.
     assert fingerprint(["a", "b"], 10) != fingerprint(["a", "b"], 1)
+
+
+def test_fingerprint_binds_the_request_plan():
+    plan = ["https://h/x", "POST", ".", "single", headers_digest({"Authorization": "Bearer k"})]
+    assert fingerprint(["a"], 1, plan) == fingerprint(["a"], 1, list(plan))
+    for i, changed in enumerate(["https://h/y", "PUT", "{a}", "batch", headers_digest({"Authorization": "Bearer j"})]):
+        assert fingerprint(["a"], 1, plan[:i] + [changed] + plan[i + 1:]) != fingerprint(["a"], 1, plan)
+    assert fingerprint(["a"], 1, plan) != fingerprint(["a"], 1)
+
+
+def test_plan_fields_are_length_prefixed_too():
+    assert fingerprint(["a"], 1, ["ab", "c"]) != fingerprint(["a"], 1, ["a", "bc"])
+    # Ids and plan are separate sequences: moving a field between them changes the digest.
+    assert fingerprint(["a", "b"], 1, []) != fingerprint(["a"], 1, ["b"])
+
+
+def test_headers_digest_ignores_name_case_and_order_but_not_values():
+    assert headers_digest({"A": "1", "b": "2"}) == headers_digest({"B": "2", "a": "1"})
+    assert headers_digest({"A": "1"}) != headers_digest({"A": "2"})
+    assert headers_digest({"A": "1", "B": ""}) != headers_digest({"A": "1"})
+    assert b"secret" not in headers_digest({"Authorization": "secret"})
 
 
 def test_encode_decode_round_trip():

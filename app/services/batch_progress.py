@@ -9,12 +9,15 @@ a redelivered bundle resumes after the last delivered request.
 Bits index requests (chunks), not items: a generic endpoint answers a batch
 request with one status and no per-item result. That makes the chunking part
 of what a bit means, so the fingerprint binds the chunk size as well as the
-ordered item ids, and a config change between deliveries invalidates the
-record instead of mapping old bits onto different chunks.
+ordered item ids. It also binds the caller's request plan (where and how the
+requests are sent), so a config change between deliveries invalidates the
+record. That matters because permanently rejected requests are recorded as
+settled: after a user fixes the URL or the credentials, a redelivered bundle
+must send them again.
 """
 import hashlib
 import logging
-from typing import Iterable, Optional, Set
+from typing import Iterable, Mapping, Optional, Sequence, Set
 
 import redis.asyncio as redis
 
@@ -30,8 +33,26 @@ def progress_key(batch_id, integration_id, output_type) -> str:
     return f"{KEY_PREFIX}.{batch_id}.{integration_id}.{output_type}"
 
 
-def fingerprint(item_ids: Iterable, chunk_size: int) -> bytes:
-    """8-byte digest binding a record to an exact ordered id list and chunk size.
+def _update_length_prefixed(h, fields: Sequence) -> None:
+    h.update(len(fields).to_bytes(4, "big"))
+    for field in fields:
+        raw = field if isinstance(field, bytes) else str(field).encode()
+        h.update(len(raw).to_bytes(4, "big"))
+        h.update(raw)
+
+
+def headers_digest(headers: Mapping[str, str]) -> bytes:
+    """SHA-256 of the headers (names case-folded, sorted), for binding into a
+    request plan. Secrets in the values only ever enter a hash."""
+    h = hashlib.sha256()
+    pairs = sorted((name.lower(), value) for name, value in headers.items())
+    _update_length_prefixed(h, [part for pair in pairs for part in pair])
+    return h.digest()
+
+
+def fingerprint(item_ids: Iterable, chunk_size: int, plan: Sequence = ()) -> bytes:
+    """8-byte digest binding a record to an exact ordered id list, chunk size
+    and request plan (any fields the caller's requests depend on).
 
     Length-prefixed with fixed-width lengths rather than delimiter-joined:
     gundi_id may be any string, and a delimiter join lets two different lists
@@ -40,13 +61,10 @@ def fingerprint(item_ids: Iterable, chunk_size: int) -> bytes:
     not produce. Truncating SHA-256 leaves ~2^-64 per comparison, acceptable
     because a record is only compared against plans for its own key.
     """
-    ids = [str(item_id).encode() for item_id in item_ids]
     h = hashlib.sha256()
     h.update(int(chunk_size).to_bytes(4, "big"))
-    h.update(len(ids).to_bytes(4, "big"))
-    for raw in ids:
-        h.update(len(raw).to_bytes(4, "big"))
-        h.update(raw)
+    _update_length_prefixed(h, [str(item_id) for item_id in item_ids])
+    _update_length_prefixed(h, list(plan))
     return h.digest()[:FINGERPRINT_BYTES]
 
 

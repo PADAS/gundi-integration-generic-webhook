@@ -18,10 +18,47 @@ OUTBOUND_BUFFER_MAX_RECORDS = env.int("OUTBOUND_BUFFER_MAX_RECORDS", 10000)
 OUTBOUND_BACKOFF_INITIAL_SECONDS = env.int("OUTBOUND_BACKOFF_INITIAL_SECONDS", 30)
 OUTBOUND_BACKOFF_MAX_SECONDS = env.int("OUTBOUND_BACKOFF_MAX_SECONDS", 900)
 
-if OUTBOUND_FLUSH_LOCK_SECONDS <= 2 * OUTBOUND_REQUEST_TIMEOUT_SECONDS:
-    # The flush loop stops starting sends 2 timeouts before its lock expires,
-    # so with this setting it would never send and buffers would never drain.
-    raise ValueError(
-        f"OUTBOUND_FLUSH_LOCK_SECONDS ({OUTBOUND_FLUSH_LOCK_SECONDS}) must be greater than "
-        f"2 x OUTBOUND_REQUEST_TIMEOUT_SECONDS ({OUTBOUND_REQUEST_TIMEOUT_SECONDS})."
-    )
+# Activity-log throttles: a full buffer's drops, and an invalid deliver config
+# found by the every-minute flush, are each reported at most this often.
+OUTBOUND_OVERFLOW_REPORT_SECONDS = env.int("OUTBOUND_OVERFLOW_REPORT_SECONDS", 600)
+OUTBOUND_INVALID_CONFIG_WARNING_SECONDS = env.int("OUTBOUND_INVALID_CONFIG_WARNING_SECONDS", 3600)
+
+_OUTBOUND_POSITIVE_INTS = (
+    "OUTBOUND_FLUSH_LOCK_SECONDS",
+    "OUTBOUND_BATCH_PROGRESS_TTL_SECONDS",
+    "OUTBOUND_BUFFER_MAX_RECORDS",
+    "OUTBOUND_BACKOFF_INITIAL_SECONDS",
+    "OUTBOUND_BACKOFF_MAX_SECONDS",
+    "OUTBOUND_OVERFLOW_REPORT_SECONDS",
+    "OUTBOUND_INVALID_CONFIG_WARNING_SECONDS",
+)
+
+
+def validate_outbound_settings(values: dict) -> None:
+    """Raise ValueError naming the first outbound setting that cannot work.
+
+    These reach Redis as SETEX/EXPIRE/SET EX times and LTRIM bounds, where zero
+    or a negative value is an error at runtime or silently empties a buffer.
+    """
+    for name in _OUTBOUND_POSITIVE_INTS:
+        value = values[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+    timeout = values["OUTBOUND_REQUEST_TIMEOUT_SECONDS"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
+        raise ValueError(f"OUTBOUND_REQUEST_TIMEOUT_SECONDS must be a positive number; got {timeout!r}.")
+    if values["OUTBOUND_BACKOFF_INITIAL_SECONDS"] > values["OUTBOUND_BACKOFF_MAX_SECONDS"]:
+        raise ValueError(
+            f"OUTBOUND_BACKOFF_INITIAL_SECONDS ({values['OUTBOUND_BACKOFF_INITIAL_SECONDS']}) must not exceed "
+            f"OUTBOUND_BACKOFF_MAX_SECONDS ({values['OUTBOUND_BACKOFF_MAX_SECONDS']})."
+        )
+    if values["OUTBOUND_FLUSH_LOCK_SECONDS"] <= 2 * timeout:
+        # The flush loop stops starting sends 2 timeouts before its lock expires,
+        # so with this setting it would never send and buffers would never drain.
+        raise ValueError(
+            f"OUTBOUND_FLUSH_LOCK_SECONDS ({values['OUTBOUND_FLUSH_LOCK_SECONDS']}) must be greater than "
+            f"2 x OUTBOUND_REQUEST_TIMEOUT_SECONDS ({timeout})."
+        )
+
+
+validate_outbound_settings(globals())

@@ -83,7 +83,14 @@ Settings (`app/settings/integration.py`):
 | `OUTBOUND_BATCH_PROGRESS_TTL_SECONDS` | 25 h |
 | `OUTBOUND_BUFFER_MAX_RECORDS` | 10000 |
 | `OUTBOUND_BACKOFF_INITIAL_SECONDS` | 30 |
-| `OUTBOUND_BACKOFF_MAX_SECONDS` | 900 |
+| `OUTBOUND_BACKOFF_MAX_SECONDS` | 900; must be ≥ the initial backoff |
+| `OUTBOUND_OVERFLOW_REPORT_SECONDS` | 600: buffer-overflow ERRORs at most this often |
+| `OUTBOUND_INVALID_CONFIG_WARNING_SECONDS` | 3600: invalid-deliver-config WARNINGs at most this often |
+
+Every count and duration must be a positive integer, and the timeout a
+positive number. `validate_outbound_settings` checks them at import, together
+with the relationships noted above, and raises an error naming the setting and
+its value.
 
 ## JQ semantics
 
@@ -198,10 +205,22 @@ Redelivery dedup (`app/services/batch_progress.py`, ported from the ER
 dispatcher): one Redis record per (batch_id, integration, output type) holds
 a fingerprint and a bitmap of **settled requests** (delivered, or permanently
 rejected and logged). Bits index requests, not records, because a generic
-endpoint gives no per-record result. The fingerprint binds the ordered
-`gundi_id`s and the chunk size, so a config change between attempts
-invalidates the record. The bundle is then re-sent in full (duplicates, never
-loss). Progress is written after every request, so after a retryable failure
+endpoint gives no per-record result. The fingerprint (a truncated SHA-256
+over length-prefixed fields) binds exactly:
+
+- the ordered `gundi_id`s of the type's records;
+- the chunk size (`max_batch_size` in batch mode, 1 in single mode);
+- the request plan: the endpoint URL, the HTTP method, the JQ filter, and
+  batch vs single mode (a batch of 1 sends an array, single mode an object);
+- a SHA-256 of the effective headers (names case-folded and sorted, with their
+  values: the API key header, custom headers and `Content-Type`), or a fixed
+  marker when the auth config is invalid.
+
+Header values only ever enter a hash; nothing secret is stored or logged.
+Any change to these between attempts invalidates the record. The bundle is
+then re-sent in full: duplicates, never loss. This matters because rejected
+requests are recorded as settled, so a fixed URL or rotated credentials make
+them go out again. Progress is written after every request, so after a retryable failure
 the redelivered bundle resumes at the failed request. Records expire after
 25 h. A Redis failure reads as "nothing settled".
 

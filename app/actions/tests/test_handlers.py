@@ -712,3 +712,52 @@ async def test_drops_deferred_to_a_failed_flush_are_reported_once(outbound_env, 
     errors = [c.kwargs for c in log_activity.call_args_list if c.kwargs["level"] == LogLevel.ERROR]
     assert [e["data"]["dropped"] for e in errors] == [3]
     assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 0
+
+
+# Progress binds the request plan
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_config, changed_auth", [
+    ({"event_url": "https://hooks.example.com/fixed-events"}, AUTH_CONFIG_DATA),
+    ({"event_method": "PUT"}, AUTH_CONFIG_DATA),
+    ({"event_jq_filter": "{t: .title}"}, AUTH_CONFIG_DATA),
+    ({"event_batch_mode": True, "event_max_batch_size": 1}, AUTH_CONFIG_DATA),  # same chunking, array body
+    ({}, {**AUTH_CONFIG_DATA, "api_key": "rotated"}),
+    ({}, {**AUTH_CONFIG_DATA, "custom_headers": []}),
+])
+async def test_a_plan_change_resends_requests_settled_as_rejected(outbound_env, changed_config, changed_auth):
+    send_json, _ = outbound_env
+    bundle = _bundle([event(0)])
+    send_json.side_effect = client.EndpointAuthError("HTTP 401", 401)
+    await _deliver_batch(bundle)  # rejected: settled, not delivered
+    send_json.reset_mock(side_effect=True)
+
+    result = await _deliver_batch(bundle, auth=changed_auth, **changed_config)
+
+    assert send_json.call_count == 1
+    assert result["delivered"]["event"]["already_settled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_plan_still_skips_settled_requests(outbound_env):
+    send_json, _ = outbound_env
+    bundle = _bundle([event(0)])
+    send_json.side_effect = client.EndpointAuthError("HTTP 401", 401)
+    await _deliver_batch(bundle)
+    send_json.reset_mock(side_effect=True)
+
+    result = await _deliver_batch(bundle)
+
+    send_json.assert_not_called()
+    assert result["delivered"]["event"]["already_settled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_auth_config_does_not_break_the_bundle(outbound_env):
+    send_json, log_activity = outbound_env
+
+    result = await _deliver_batch(_bundle([event(0)]), auth={"api_key_header": "bad header"})
+
+    send_json.assert_not_called()
+    assert result["delivered"]["event"]["failed"] == 1
+    assert log_activity.call_args.kwargs["data"]["error_type"] == "configuration"
