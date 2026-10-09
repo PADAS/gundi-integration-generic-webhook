@@ -20,9 +20,8 @@ def jq_all(filter_expression: str, input_data: Any) -> List[Any]:
     pyjq raises ValueError for a filter that does not compile and
     pyjq.ScriptRuntimeError for one that fails on the data.
     """
-    # The inbound handler always ran filters with line breaks removed, and saved
-    # filters were written against that, so it stays for both directions.
-    return pyjq.all(filter_expression.replace("\n", ""), input_data)
+    # jq rejects \r; deleting line breaks instead would glue tokens (`.a⏎and` reads field `aand`).
+    return pyjq.all(filter_expression.replace("\r\n", "\n").replace("\r", "\n"), input_data)
 
 
 def outbound_body(filter_expression: str, input_data: Any) -> Tuple[bool, Any]:

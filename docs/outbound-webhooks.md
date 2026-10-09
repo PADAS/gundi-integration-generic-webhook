@@ -122,8 +122,32 @@ A filter that fails to compile or to run is a configuration error. Delivery
 treats it like any other permanent failure (below). **In batch mode the
 filter runs on the whole chunk, so a runtime error caused by one malformed
 record drops the whole chunk** (logged with every `gundi_id`). Write batch
-filters defensively, e.g. `map(.x | tonumber? // null)`. Line breaks are
-removed before the filter runs, as the inbound webhook always did.
+filters defensively, e.g. `map(.x | tonumber? // null)`.
+
+**Line breaks and comments** (same rules for inbound webhook filters, which
+share `jq_all` in `app/services/jq_transform.py`): the filter goes to jq as
+written, with `\r\n` and `\r` turned into `\n`. So multi-line filters work as
+in the jq CLI:
+
+- a line break is whitespace (`if … then .b⏎else .a⏎end`, `and`/`or` at the
+  start of a line);
+- `#` starts a comment that ends at the line break, so later lines still run;
+  a `#` inside a string is just a character;
+- a raw line break inside a string literal is a newline in the string.
+
+Line breaks used to be **deleted** before compiling. Filters that compiled
+that way give the same output now, except where the deletion changed their
+meaning:
+
+- it glued two tokens: `.a⏎and .b` read the field `aand`;
+- a `#` comment swallowed every later line, which now run;
+- a raw line break inside a string was dropped, and is now kept;
+- a line break inside a name (`.fo⏎o`) used to read `.foo`, and is now a
+  syntax error.
+
+Multi-line `if/then/else` used to fail to compile, as did `and`/`or` at the
+start of a line after a name (`null⏎or` became `nullor`); they now work. CRLF filters always failed, because jq rejects
+`\r`; they now work too.
 
 ## The transformation editor contract
 
