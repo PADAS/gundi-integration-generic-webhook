@@ -8,7 +8,8 @@ so delivery is at-least-once: a crash between a 2xx and the trim re-sends.
 
 A buffer is capped (oldest records dropped past the cap) and backs off after
 a transient failure, so an endpoint outage neither grows Redis without bound
-nor gets hit once per incoming record.
+nor gets hit once per incoming record. Drops are counted in a `.dropped` key
+for the caller to report (take_dropped).
 """
 import json
 import logging
@@ -25,12 +26,37 @@ logger = logging.getLogger(__name__)
 
 KEY_PREFIX = "outbound_buffer"
 
-# Delete the lock only if this flusher still holds it.
-_RELEASE_LOCK = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('del', KEYS[1])
+# Append, then apply the cap unless a flush holds the lock: a flush trims the
+# head by the count it read, so trimming the head under it would drop records
+# it never sent. The flush applies the deferred cap when it releases (below).
+# KEYS: buffer, lock, dropped counter. ARGV: entry, cap. Returns {length, dropped}.
+_PUSH = """
+local length = redis.call('rpush', KEYS[1], ARGV[1])
+local excess = length - tonumber(ARGV[2])
+if excess > 0 and redis.call('exists', KEYS[2]) == 0 then
+    redis.call('ltrim', KEYS[1], excess, -1)
+    redis.call('incrby', KEYS[3], excess)
+    return {length - excess, excess}
 end
-return 0
+return {length, 0}
+"""
+
+# Release the lock if this flusher still holds it, first applying any cap that
+# pushes deferred while it was held. KEYS: lock, buffer, dropped counter.
+# ARGV: token, cap. Returns the number of records dropped.
+_RELEASE_AND_CAP = """
+if redis.call('get', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+local excess = redis.call('llen', KEYS[2]) - tonumber(ARGV[2])
+if excess > 0 then
+    redis.call('ltrim', KEYS[2], excess, -1)
+    redis.call('incrby', KEYS[3], excess)
+else
+    excess = 0
+end
+redis.call('del', KEYS[1])
+return excess
 """
 
 # Trim only while still holding the lock. A flusher whose lock expired
@@ -65,10 +91,6 @@ def _dropped_key(integration_id, output_type) -> str:
     return f"{buffer_key(integration_id, output_type)}.dropped"
 
 
-# The cap trim holds the flush lock for two Redis calls; a crash in between must
-# not block flushes for the full OUTBOUND_FLUSH_LOCK_SECONDS.
-CAP_TRIM_LOCK_SECONDS = 10
-
 # Upper bound on an endpoint's Retry-After, so a bogus value cannot park a buffer for weeks.
 MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
 
@@ -95,36 +117,30 @@ class OutboundBuffer:
         token = uuid.uuid4().hex
         return token if await self.db_client.set(lock_key, token, nx=True, ex=lock_seconds) else None
 
-    async def _release(self, lock_key: str, token: str):
+    async def _release(self, integration_id, output_type, token: str, max_records: int):
         try:
-            await self.db_client.eval(_RELEASE_LOCK, 1, lock_key, token)
+            await self.db_client.eval(
+                _RELEASE_AND_CAP, 3,
+                _lock_key(integration_id, output_type), buffer_key(integration_id, output_type),
+                _dropped_key(integration_id, output_type), token, max_records,
+            )
         except Exception as e:
-            # The lock expires on its own; a stuck release only delays the next flush.
-            logger.warning(f"Could not release '{lock_key}': {type(e).__name__}: {e}")
+            # The lock expires on its own, and the next push applies the cap.
+            logger.warning(f"Could not release the flush lock for '{buffer_key(integration_id, output_type)}': "
+                           f"{type(e).__name__}: {e}")
 
     async def push(self, integration_id, output_type, record: Any, max_records: Optional[int] = None) -> PushResult:
         """Append a JSON-safe record. Past max_records the oldest records are
-        dropped; PushResult.dropped says how many."""
+        dropped (and counted for take_dropped); PushResult.dropped says how many.
+        While a flush runs the cap is deferred to its release."""
         max_records = max_records or settings.OUTBOUND_BUFFER_MAX_RECORDS
-        key = buffer_key(integration_id, output_type)
         entry = json.dumps({"enqueued_at": time.time(), "record": record})
-        length = await self.db_client.rpush(key, entry)
-        if length <= max_records:
-            return PushResult(length=length)
-        # Trimmed under the flush lock: a flush trims the head by the count it
-        # read, so trimming the head under it would drop records it never sent.
-        # If a flush holds the lock, the next push trims instead.
-        lock_key = _lock_key(integration_id, output_type)
-        token = await self._acquire(lock_key, CAP_TRIM_LOCK_SECONDS)
-        if not token:
-            return PushResult(length=length)
-        try:
-            excess = await self.db_client.llen(key) - max_records
-            if excess > 0 and await self.db_client.eval(_TRIM_IF_LOCKED, 2, lock_key, key, token, excess):
-                return PushResult(length=length - excess, dropped=excess)
-            return PushResult(length=length)
-        finally:
-            await self._release(lock_key, token)
+        length, dropped = await self.db_client.eval(
+            _PUSH, 3,
+            buffer_key(integration_id, output_type), _lock_key(integration_id, output_type),
+            _dropped_key(integration_id, output_type), entry, max_records,
+        )
+        return PushResult(length=int(length), dropped=int(dropped))
 
     async def backoff_remaining(self, integration_id, output_type) -> float:
         """Seconds until the buffer may be flushed again after a transient failure."""
@@ -159,9 +175,9 @@ class OutboundBuffer:
             _backoff_key(integration_id, output_type), _failures_key(integration_id, output_type),
         )
 
-    async def add_dropped(self, integration_id, output_type, count: int):
-        """Count records dropped by the cap until take_dropped reports them."""
-        await self.db_client.incrby(_dropped_key(integration_id, output_type), count)
+    async def pending_dropped(self, integration_id, output_type) -> int:
+        """Records dropped by the cap and not yet taken."""
+        return int(await self.db_client.get(_dropped_key(integration_id, output_type)) or 0)
 
     async def take_dropped(self, integration_id, output_type) -> int:
         """Records dropped since the last call."""
@@ -200,10 +216,13 @@ class OutboundBuffer:
             send: Callable[[List[Any]], Awaitable[None]],
             lock_seconds: Optional[int] = None,
             request_timeout: Optional[float] = None,
+            max_records: Optional[int] = None,
     ) -> FlushResult:
         """Send batches while the buffer is due: holding a full batch, or a head
         older than max_wait_seconds. Returns without sending if another flush
-        holds the lock. Exceptions from `send` propagate after the lock is released."""
+        holds the lock. On release, success or not, applies the cap pushes
+        deferred meanwhile. Exceptions from `send` propagate after the release."""
+        max_records = max_records or settings.OUTBOUND_BUFFER_MAX_RECORDS
         lock_seconds = lock_seconds or settings.OUTBOUND_FLUSH_LOCK_SECONDS
         request_timeout = request_timeout or settings.OUTBOUND_REQUEST_TIMEOUT_SECONDS
         key = buffer_key(integration_id, output_type)
@@ -233,5 +252,5 @@ class OutboundBuffer:
                 batches_sent += 1
                 records_sent += len(records)
         finally:
-            await self._release(lock_key, token)
+            await self._release(integration_id, output_type, token, max_records)
         return FlushResult(batches_sent=batches_sent, records_sent=records_sent)

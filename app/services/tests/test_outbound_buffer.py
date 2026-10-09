@@ -52,40 +52,97 @@ async def test_push_returns_the_buffer_length(buffer):
     assert await buffer.push("integration-1", "observation", {"n": 2}) == (2, 0)
 
 
+DROPPED_KEY = f"{KEY}.dropped"
+
+
+def _ns(redis):
+    return [json.loads(e)["record"]["n"] for e in redis.lists.get(KEY, [])]
+
+
 @pytest.mark.asyncio
-async def test_push_past_the_cap_drops_the_oldest(buffer, redis):
+async def test_push_past_the_cap_drops_the_oldest_and_counts_them(buffer, redis):
     for n in range(3):
         await buffer.push("integration-1", "observation", {"n": n}, max_records=3)
 
     result = await buffer.push("integration-1", "observation", {"n": 3}, max_records=3)
 
     assert result == (3, 1)
-    assert [json.loads(e)["record"]["n"] for e in redis.lists[KEY]] == [1, 2, 3]
+    assert _ns(redis) == [1, 2, 3]
+    assert await buffer.pending_dropped("integration-1", "observation") == 1
     assert LOCK_KEY not in redis.values
-    # Short-lived, so a crash mid-trim does not block flushes for the full flush lock.
-    assert redis.ttls[LOCK_KEY] == outbound_buffer.CAP_TRIM_LOCK_SECONDS
 
 
 @pytest.mark.asyncio
-async def test_dropped_counts_accumulate_until_taken(buffer):
-    await buffer.add_dropped("integration-1", "observation", 2)
-    await buffer.add_dropped("integration-1", "observation", 3)
-
-    assert await buffer.take_dropped("integration-1", "observation") == 5
-    assert await buffer.take_dropped("integration-1", "observation") == 0
-
-
-@pytest.mark.asyncio
-async def test_push_past_the_cap_leaves_trimming_to_a_running_flush(buffer, redis):
-    # Trimming the head under a flush would drop records the flush read but has not sent.
+async def test_a_push_during_a_flush_defers_the_cap_to_the_flush_release(buffer, redis):
     for n in range(3):
         await buffer.push("integration-1", "observation", {"n": n}, max_records=3)
-    await redis.set(LOCK_KEY, "flusher", nx=True, ex=300)
+    _age_head(redis, 120)  # due by age; the batch size is larger than the buffer, so one send
+    pushes = []
 
-    result = await buffer.push("integration-1", "observation", {"n": 3}, max_records=3)
+    async def send_while_a_burst_arrives(records):
+        for n in range(10, 15):
+            pushes.append(await buffer.push("integration-1", "observation", {"n": n}, max_records=3))
+        # Over the cap while the flush holds the lock: nothing trimmed under it.
+        assert len(redis.lists[KEY]) == 8
 
-    assert result == (4, 0)
-    assert len(redis.lists[KEY]) == 4
+    await buffer.flush(
+        "integration-1", "observation", max_batch_size=10, max_wait_seconds=60,
+        send=send_while_a_burst_arrives, lock_seconds=300, request_timeout=30, max_records=3,
+    )
+
+    assert all(p.dropped == 0 for p in pushes)
+    # The flush sent and trimmed 0-2, then released: 5 left, capped to the newest 3.
+    assert _ns(redis) == [12, 13, 14]
+    assert await buffer.take_dropped("integration-1", "observation") == 2
+    assert LOCK_KEY not in redis.values
+
+
+@pytest.mark.asyncio
+async def test_a_failed_flush_still_applies_the_deferred_cap(buffer, redis):
+    for n in range(3):
+        await buffer.push("integration-1", "observation", {"n": n}, max_records=3)
+
+    async def burst_then_fail(records):
+        for n in range(10, 12):
+            await buffer.push("integration-1", "observation", {"n": n}, max_records=3)
+        raise RuntimeError("endpoint down")
+
+    with pytest.raises(RuntimeError):
+        await buffer.flush(
+            "integration-1", "observation", max_batch_size=3, max_wait_seconds=60,
+            send=burst_then_fail, lock_seconds=300, request_timeout=30, max_records=3,
+        )
+
+    assert _ns(redis) == [2, 10, 11]
+    assert await buffer.take_dropped("integration-1", "observation") == 2
+    assert LOCK_KEY not in redis.values
+
+
+@pytest.mark.asyncio
+async def test_a_flusher_that_lost_its_lock_leaves_the_cap_to_the_new_holder(buffer, redis):
+    for n in range(5):
+        await buffer.push("integration-1", "observation", {"n": n}, max_records=10)
+
+    async def lose_lock(records):
+        redis.values[LOCK_KEY] = b"other-flusher"
+
+    await buffer.flush(
+        "integration-1", "observation", max_batch_size=3, max_wait_seconds=60,
+        send=lose_lock, lock_seconds=300, request_timeout=30, max_records=2,
+    )
+
+    assert len(redis.lists[KEY]) == 5
+    assert redis.values[LOCK_KEY] == b"other-flusher"
+    assert await buffer.pending_dropped("integration-1", "observation") == 0
+
+
+@pytest.mark.asyncio
+async def test_dropped_counts_accumulate_until_taken(buffer, redis):
+    for n in range(6):
+        await buffer.push("integration-1", "observation", {"n": n}, max_records=2)
+
+    assert await buffer.take_dropped("integration-1", "observation") == 4
+    assert await buffer.take_dropped("integration-1", "observation") == 0
 
 
 @pytest.mark.asyncio

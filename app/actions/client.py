@@ -52,8 +52,9 @@ class EndpointRejectedError(EndpointError):
 
 
 class EndpointRequestError(EndpointError):
-    """The request could not be built from the given headers (e.g. a CR/LF or a
-    non-ASCII character in a value). Sending it again fails the same way."""
+    """The request could not be built from the given URL or headers (e.g. an
+    out-of-range port, a CR/LF or a non-ASCII character in a header value).
+    Sending it again fails the same way."""
 
 
 def _host(url: str) -> str:
@@ -87,6 +88,16 @@ async def send_json(
 ) -> httpx.Response:
     """Send `body` as JSON and return the 2xx response, or raise an EndpointError."""
     host = _host(url)
+    # InvalidURL is not a TransportError and would escape unclassified. Messages
+    # name the host only: the exception text quotes the URL.
+    try:
+        port = httpx.URL(url).port
+    except httpx.InvalidURL as e:
+        raise EndpointRequestError(f"Could not build the request to {host}: the URL is invalid") from e
+    # httpx parses any number as a port and only fails at connect time, which
+    # would read as a retryable connection error.
+    if port is not None and not 0 < port < 65536:
+        raise EndpointRequestError(f"Could not build the request to {host}: the port is out of range")
     owns_client = client is None
     # Redirects are not followed: the URL was vetted against private addresses
     # before this call, and a redirect target would not have been.
@@ -99,6 +110,9 @@ async def send_json(
         raise EndpointRequestError(f"Could not build the request to {host}: invalid header") from e
     except UnicodeEncodeError as e:
         raise EndpointRequestError(f"Could not build the request to {host}: a header value is not ASCII") from e
+    # A TransportError subclass, but no retry can change the URL's scheme.
+    except httpx.UnsupportedProtocol as e:
+        raise EndpointRequestError(f"Could not build the request to {host}: unsupported URL scheme") from e
     except httpx.TransportError as e:
         raise EndpointConnectionError(f"Could not reach {host}: {type(e).__name__}") from e
     finally:

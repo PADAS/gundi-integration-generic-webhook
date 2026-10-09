@@ -1,10 +1,11 @@
 """In-memory stand-in for the async Redis calls the outbound modules make.
 
 Values come back as bytes, like redis-py without decode_responses. eval()
-emulates the two Lua scripts in app/services/outbound_buffer.py by what they
-are meant to do; the Lua itself is not run, so a change to the scripts is not
+emulates the Lua scripts in app/services/outbound_buffer.py by what they are
+meant to do; the Lua itself is not run, so a change to the scripts is not
 covered by these tests. TTLs are recorded, not enforced.
 """
+from app.services import outbound_buffer
 
 
 def _bytes(value):
@@ -76,10 +77,28 @@ class FakeRedis:
 
     async def eval(self, script, numkeys, *keys_and_args):
         keys, args = keys_and_args[:numkeys], keys_and_args[numkeys:]
+        if script == outbound_buffer._PUSH:
+            buffer, lock, dropped = keys
+            length = await self.rpush(buffer, args[0])
+            excess = length - int(args[1])
+            if excess > 0 and lock not in self.values:
+                await self.ltrim(buffer, excess, -1)
+                await self.incrby(dropped, excess)
+                return [length - excess, excess]
+            return [length, 0]
         holds_lock = self.values.get(keys[0]) == _bytes(args[0])
-        if "ltrim" in script:
+        if script == outbound_buffer._TRIM_IF_LOCKED:
             if not holds_lock:
                 return 0
             await self.ltrim(keys[1], int(args[1]), -1)
             return 1
-        return await self.delete(keys[0]) if holds_lock else 0
+        if script == outbound_buffer._RELEASE_AND_CAP:
+            if not holds_lock:
+                return 0
+            excess = len(self.lists.get(keys[1], [])) - int(args[1])
+            if excess > 0:
+                await self.ltrim(keys[1], excess, -1)
+                await self.incrby(keys[2], excess)
+            await self.delete(keys[0])
+            return max(excess, 0)
+        raise NotImplementedError("FakeRedis does not emulate this script")

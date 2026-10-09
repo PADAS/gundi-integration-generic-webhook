@@ -219,6 +219,17 @@ async def _log_dropped(integration: Integration, action_id: str, payloads: List[
 async def _flush_buffer(
         integration: Integration, action_id: str, endpoint: EndpointSettings, *, drain: bool = False,
 ) -> dict:
+    """_flush_due, then report what the buffer cap dropped: on push, or when
+    this flush released its lock. Never raises."""
+    try:
+        return await _flush_due(integration, action_id, endpoint, drain=drain)
+    finally:
+        await _report_buffer_overflow(integration, action_id, endpoint.output_type)
+
+
+async def _flush_due(
+        integration: Integration, action_id: str, endpoint: EndpointSettings, *, drain: bool = False,
+) -> dict:
     """Send what is due in the endpoint's buffer; with drain, everything in it.
 
     A permanent failure drops the batch (logged) so it cannot block the buffer.
@@ -286,32 +297,37 @@ async def _drop_buffer(integration: Integration, action_id: str, output_type: Ou
     return {**result._asdict(), "dropped": True}
 
 
-async def _report_buffer_overflow(integration: Integration, output_type: OutputType, dropped: int):
+async def _report_buffer_overflow(integration: Integration, action_id: str, output_type: OutputType):
     """ERROR for records the buffer cap dropped, at most once per
-    BUFFER_OVERFLOW_REPORT_SECONDS, with the count since the last report."""
+    BUFFER_OVERFLOW_REPORT_SECONDS, with the count since the last report.
+    Never raises."""
     integration_id = str(integration.id)
-    await outbound_buffer.add_dropped(integration_id, output_type.value, dropped)
     try:
-        first_in_window = await state_manager.set_if_absent(
-            integration_id=integration_id, action_id="deliver",
-            source_id=f"buffer-overflow-{output_type.value}", ttl_seconds=BUFFER_OVERFLOW_REPORT_SECONDS,
-        )
-    except Exception:
-        first_in_window = True  # surface it rather than hide it when the throttle is unavailable
-    if not first_in_window:
-        return
-    total = await outbound_buffer.take_dropped(integration_id, output_type.value)
-    if total:
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="deliver",
-            title=(
-                f"The {_label(output_type)} buffer is full; dropped {total} of its oldest record(s) "
-                f"since the last report. The endpoint has not accepted data for a while."
-            ),
-            level=LogLevel.ERROR,
-            data={"output_type": output_type.value, "dropped": total},
-        )
+        if not await outbound_buffer.pending_dropped(integration_id, output_type.value):
+            return
+        try:
+            first_in_window = await state_manager.set_if_absent(
+                integration_id=integration_id, action_id="deliver",
+                source_id=f"buffer-overflow-{output_type.value}", ttl_seconds=BUFFER_OVERFLOW_REPORT_SECONDS,
+            )
+        except Exception:
+            first_in_window = True  # surface it rather than hide it when the throttle is unavailable
+        if not first_in_window:
+            return
+        total = await outbound_buffer.take_dropped(integration_id, output_type.value)
+        if total:
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id=action_id,
+                title=(
+                    f"The {_label(output_type)} buffer is full; dropped {total} of its oldest record(s) "
+                    f"since the last report. The endpoint has not accepted data for a while."
+                ),
+                level=LogLevel.ERROR,
+                data={"output_type": output_type.value, "dropped": total},
+            )
+    except Exception as e:
+        logger.warning(f"Could not report buffer overflow for integration '{integration_id}': {type(e).__name__}: {e}")
 
 
 async def action_auth(integration: Integration, action_config: AuthenticateConfig):
@@ -351,8 +367,6 @@ async def action_deliver(
         # Once buffered the record is ours to deliver: a failed flush below must
         # not fail the run, or Pub/Sub would redeliver and buffer it twice.
         pushed = await outbound_buffer.push(str(integration.id), output_type.value, record)
-        if pushed.dropped:
-            await _report_buffer_overflow(integration, output_type, pushed.dropped)
         flushed = await _flush_buffer(integration, "deliver", endpoint)
         return {"buffered": True, "output_type": output_type.value, "buffer_length": pushed.length, "flush": flushed}
 

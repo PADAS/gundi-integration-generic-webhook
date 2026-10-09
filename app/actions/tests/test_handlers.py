@@ -689,3 +689,26 @@ async def test_buffer_overflow_errors_are_throttled_and_carry_the_accumulated_co
     reports = [c.kwargs for c in log_activity.call_args_list if c.kwargs["level"] == LogLevel.ERROR]
     assert [r["data"]["dropped"] for r in reports] == [1, 3]
     assert "dropped 3 of its oldest record(s) since the last report" in reports[1]["title"]
+
+
+@pytest.mark.asyncio
+async def test_drops_deferred_to_a_failed_flush_are_reported_once(outbound_env, fake_redis, mocker):
+    send_json, log_activity = outbound_env
+    mocker.patch.object(settings, "OUTBOUND_BUFFER_MAX_RECORDS", 2)
+    integration_id = str(make_integration().id)
+    key = await _push_aged(fake_redis, [observation(0), observation(1)], age_seconds=120)
+
+    async def burst_then_503(**kwargs):
+        for n in range(10, 13):
+            await handlers.outbound_buffer.push(integration_id, "observation", observation(n))
+        raise client.EndpointServerError("HTTP 503", 503)
+
+    send_json.side_effect = burst_then_503
+    integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
+
+    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+
+    assert len(fake_redis.lists[key]) == 2
+    errors = [c.kwargs for c in log_activity.call_args_list if c.kwargs["level"] == LogLevel.ERROR]
+    assert [e["data"]["dropped"] for e in errors] == [3]
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 0

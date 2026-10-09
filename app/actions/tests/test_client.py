@@ -165,3 +165,20 @@ async def test_the_real_transport_refuses_headers_the_config_now_rejects(local_s
 
     assert not exc_info.value.retryable
     assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://hooks.example.com:99999/secret-path?token=abc",  # port out of range (httpx parses it)
+    "https://hooks.example.com:-1/secret-path?token=abc",
+    "https://hooks.example.com:abc/secret-path?token=abc",  # non-numeric port
+    "ftp://hooks.example.com/secret-path?token=abc",  # unsupported scheme (a TransportError subclass)
+])
+async def test_urls_httpx_cannot_use_are_a_permanent_request_error(url):
+    # Real httpx parsing: these fail before any connection is attempted.
+    with pytest.raises(client.EndpointRequestError) as exc_info:
+        await client.send_json(url, "POST", {}, {}, timeout=5)
+
+    assert not exc_info.value.retryable
+    assert "hooks.example.com" in str(exc_info.value)
+    assert "secret-path" not in str(exc_info.value) and "token" not in str(exc_info.value)

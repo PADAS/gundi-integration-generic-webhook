@@ -167,9 +167,14 @@ the `deliver` run, since a redelivery would buffer the record twice.
   resets the streak.
 - **Cap**: past `OUTBOUND_BUFFER_MAX_RECORDS` the oldest records are dropped.
   The ERROR is published at most once every 10 minutes per buffer, with the
-  number dropped since the last report. The cap is applied under the flush
-  lock, taken with a short 10 s TTL so a crash mid-trim does not block
-  flushes; while a flush runs, the next push applies it instead.
+  number dropped since the last report.
+  - A push appends and applies the cap in one script. A running flush holds
+    the lock and trims the head by the count it read, so a trim under it
+    would drop unsent records. While the lock is held the push skips the cap.
+  - The flush applies the deferred cap when it releases the lock, still
+    holding its token, whether it succeeded or failed.
+  - Both count what they drop in the buffer's `.dropped` key, and the report
+    takes that count.
 - **Left-behind buffers**: when a type leaves batch mode or is deselected,
   `flush_buffers` drains what is left. It sends the records with the type's
   current settings if it still has a URL, even when the type was deselected:
