@@ -796,3 +796,28 @@ async def test_the_sweep_respects_a_buffers_backoff(outbound_env, fake_redis):
 async def test_a_quiet_integration_reports_no_sweep(outbound_env):
     result = await _deliver(event(1), observation_batch_mode=True)
     assert "other_buffers" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["backoff_remaining", "flush"])
+async def test_a_redis_failure_after_the_push_does_not_fail_the_delivery(outbound_env, fake_redis, mocker, failing):
+    # Raising here would make Pub/Sub redeliver a record the buffer already holds.
+    mocker.patch.object(handlers.outbound_buffer, failing, mocker.AsyncMock(side_effect=RedisError("down")))
+
+    result = await _deliver(observation(0), observation_batch_mode=True, observation_max_batch_size=1)
+
+    assert result["buffered"] is True
+    assert "RedisError" in result["flush"]["error"]
+    assert [r["external_source_id"] for r in _buffer_records(fake_redis)] == ["collar-0"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_warning_publish_after_a_failed_flush_does_not_fail_the_delivery(outbound_env, fake_redis):
+    send_json, log_activity = outbound_env
+    send_json.side_effect = client.EndpointServerError("HTTP 503", 503)
+    log_activity.side_effect = ConnectionError("pubsub down")
+
+    result = await _deliver(observation(0), observation_batch_mode=True, observation_max_batch_size=1)
+
+    assert result["buffered"] is True and "error" in result["flush"]
+    assert len(_buffer_records(fake_redis)) == 1

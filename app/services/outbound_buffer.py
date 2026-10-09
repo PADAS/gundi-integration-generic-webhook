@@ -201,9 +201,14 @@ class OutboundBuffer:
         if head is None:
             return False
         try:
-            enqueued_at = json.loads(head)["enqueued_at"]
+            enqueued_at = float(json.loads(head)["enqueued_at"])
+            if not math.isfinite(enqueued_at):
+                raise ValueError("not a finite number")
         except (ValueError, KeyError, TypeError):
-            return True  # an unreadable head must not block the buffer forever
+            # Due now: a head whose age cannot be read (or that would never age,
+            # like NaN or inf) must not block the buffer forever.
+            logger.warning(f"The oldest record in outbound buffer '{key}' has no usable enqueue time; flushing now.")
+            return True
         return time.time() - enqueued_at >= max_wait_seconds
 
     async def flush(

@@ -214,9 +214,20 @@ async def _flush_buffer(
         integration: Integration, action_id: str, endpoint: EndpointSettings, *, drain: bool = False,
 ) -> dict:
     """_flush_due, then report what the buffer cap dropped: on push, or when
-    this flush released its lock. Never raises."""
+    this flush released its lock.
+
+    Never raises: callers run it after a record is pushed, and once pushed the
+    buffer owns the record. An exception escaping here would fail the delivery,
+    and the Pub/Sub redelivery would buffer the record a second time.
+    """
     try:
         return await _flush_due(integration, action_id, endpoint, drain=drain)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        logger.warning(
+            f"Flushing the {endpoint.output_type.value} buffer of integration '{integration.id}' failed: {error}"
+        )
+        return {"error": error}
     finally:
         await _report_buffer_overflow(integration, action_id, endpoint.output_type)
 
@@ -229,7 +240,8 @@ async def _flush_due(
     A permanent failure drops the batch (logged) so it cannot block the buffer.
     A transient one keeps it and backs the buffer off, skipping flushes until
     the delay passes; the WARNING is published once per failed attempt, so at
-    most once per backoff window. Never raises.
+    most once per backoff window. Call it through _flush_buffer, which keeps
+    its Redis reads and activity publishing from raising.
     """
     integration_id, output_type = str(integration.id), endpoint.output_type.value
     if remaining := await outbound_buffer.backoff_remaining(integration_id, output_type):

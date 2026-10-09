@@ -277,3 +277,25 @@ async def test_records_appended_during_a_send_are_neither_lost_nor_resent(buffer
 
     assert sent == [[0, 1, 2], [3, 4]]
     assert redis.lists[KEY] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("head", [
+    {"enqueued_at": "soon", "record": {"n": 0}},
+    {"enqueued_at": None, "record": {"n": 0}},
+    {"enqueued_at": float("nan"), "record": {"n": 0}},
+    {"enqueued_at": float("inf"), "record": {"n": 0}},
+    {"enqueued_at": float("-inf"), "record": {"n": 0}},
+    {"record": {"n": 0}},
+])
+async def test_a_head_without_a_usable_enqueue_time_is_due_now(buffer, redis, head):
+    # json.dumps writes NaN/Infinity, which json.loads reads back as floats.
+    redis.lists[KEY] = [json.dumps(head).encode()]
+
+    assert await buffer.is_due("integration-1", "observation", max_batch_size=10, max_wait_seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_a_numeric_string_enqueue_time_is_read_as_a_number(buffer, redis):
+    redis.lists[KEY] = [json.dumps({"enqueued_at": str(time.time()), "record": {}}).encode()]
+    assert not await buffer.is_due("integration-1", "observation", max_batch_size=10, max_wait_seconds=60)
