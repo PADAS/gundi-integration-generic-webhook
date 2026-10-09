@@ -93,7 +93,7 @@ async def test_a_push_during_a_flush_defers_the_cap_to_the_flush_release(buffer,
     assert all(p.dropped == 0 for p in pushes)
     # The flush sent and trimmed 0-2, then released: 5 left, capped to the newest 3.
     assert _ns(redis) == [12, 13, 14]
-    assert await buffer.take_dropped("integration-1", "observation") == 2
+    assert await buffer.pending_dropped("integration-1", "observation") == 2
     assert LOCK_KEY not in redis.values
 
 
@@ -114,7 +114,7 @@ async def test_a_failed_flush_still_applies_the_deferred_cap(buffer, redis):
         )
 
     assert _ns(redis) == [2, 10, 11]
-    assert await buffer.take_dropped("integration-1", "observation") == 2
+    assert await buffer.pending_dropped("integration-1", "observation") == 2
     assert LOCK_KEY not in redis.values
 
 
@@ -137,12 +137,13 @@ async def test_a_flusher_that_lost_its_lock_leaves_the_cap_to_the_new_holder(buf
 
 
 @pytest.mark.asyncio
-async def test_dropped_counts_accumulate_until_taken(buffer, redis):
+async def test_dropped_counts_accumulate_until_acknowledged(buffer, redis):
     for n in range(6):
         await buffer.push("integration-1", "observation", {"n": n}, max_records=2)
 
-    assert await buffer.take_dropped("integration-1", "observation") == 4
-    assert await buffer.take_dropped("integration-1", "observation") == 0
+    assert await buffer.pending_dropped("integration-1", "observation") == 4
+    await buffer.acknowledge_dropped("integration-1", "observation", 3)
+    assert await buffer.pending_dropped("integration-1", "observation") == 1
 
 
 @pytest.mark.asyncio

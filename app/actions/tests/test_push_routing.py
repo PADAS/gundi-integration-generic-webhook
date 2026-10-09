@@ -1,7 +1,6 @@
 """Both envelopes reach their handler through the runner, routed by event_type."""
 import base64
 import json
-import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,8 +14,6 @@ from app.actions.tests.conftest import (
 )
 from app.conftest import async_return
 from app.main import app
-from app.services.action_runner import execute_action
-from app.services.outbound_buffer import buffer_key
 from app.services.self_registration import register_integration_in_gundi
 
 api_client = TestClient(app)
@@ -50,7 +47,7 @@ def _push(envelope):
 
 
 def test_outbound_actions_are_discovered():
-    assert {"auth", "deliver", "deliver_batch", "flush_buffers"} <= set(get_actions())
+    assert set(get_actions()) == {"auth", "deliver", "deliver_batch"}
 
 
 def test_gundi_delivery_routes_to_deliver(runner):
@@ -101,36 +98,7 @@ def test_runner_failure_events_do_not_carry_the_endpoint_url(runner, published_e
 
 
 @pytest.mark.asyncio
-async def test_scheduled_flush_runs_with_only_a_deliver_config(runner, fake_redis):
-    (send_json, _), config_manager, _ = runner
-    key = buffer_key(INTEGRATION_ID, "observation")
-    fake_redis.lists[key] = [json.dumps({"enqueued_at": time.time() - 120, "record": observation(0)}).encode()]
-
-    result = await execute_action(integration_id=INTEGRATION_ID, action_id="flush_buffers")
-
-    assert result["flushed"]["observation"]["records_sent"] == 1
-    assert send_json.call_count == 1
-    assert fake_redis.lists[key] == []
-
-
-@pytest.mark.asyncio
-async def test_a_stored_flush_row_can_still_pause_the_schedule(runner, fake_redis):
-    (send_json, _), config_manager, _ = runner
-    paused = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
-    paused.configurations[0].action.value = "flush_buffers"
-    paused.configurations[0].data = {"run_on_schedule": False}
-    config_manager.get_action_configuration.side_effect = lambda integration_id, action_id: async_return(
-        paused.configurations[0] if action_id == "flush_buffers" else None
-    )
-
-    result = await execute_action(integration_id=INTEGRATION_ID, action_id="flush_buffers")
-
-    assert result == {"skipped": True, "reason": "run_on_schedule_disabled"}
-    send_json.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_registration_shows_one_deliver_form_and_schedules_the_flush(mocker):
+async def test_registration_shows_auth_and_one_deliver_form(mocker):
     gundi_client = mocker.MagicMock()
     gundi_client.register_integration_type = mocker.AsyncMock()
     mocker.patch("app.services.self_registration.INTEGRATION_TYPE_SLUG", "generic_webhook")
@@ -138,8 +106,9 @@ async def test_registration_shows_one_deliver_form_and_schedules_the_flush(mocke
     await register_integration_in_gundi(gundi_client=gundi_client)
 
     actions = {a["value"]: a for a in gundi_client.register_integration_type.call_args.args[0]["actions"]}
-    assert set(actions) == {"auth", "deliver", "flush_buffers"}
-    assert (actions["auth"]["type"], actions["deliver"]["type"], actions["flush_buffers"]["type"]) == (
-        "auth", "push", "pull",
-    )
-    assert actions["flush_buffers"]["crontab_schedule"]["minute"] == "*"
+    assert set(actions) == {"auth", "deliver"}
+    assert (actions["auth"]["type"], actions["deliver"]["type"]) == ("auth", "push")
+    # No pull action: the type must not look like a data source, and nothing runs on a schedule.
+    assert not any(action["is_periodic_action"] for action in actions.values())
+    # No always-green "Test Connection".
+    assert "is_executable" not in actions["auth"]["schema"]

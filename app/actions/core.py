@@ -40,17 +40,6 @@ class ExecutableActionMixin:
     pass
 
 
-class StoredConfigOptionalMixin:
-    """Marks a pull action that runs on schedule without a stored config row.
-
-    By default an automated pull with no row is skipped, which suits actions
-    that need user input. An action whose fields all have defaults and whose
-    work follows from other actions' configs (e.g. flushing what a push action
-    buffered) mixes this in, so it runs for every integration of the type. A
-    stored row, when present, still applies (including run_on_schedule).
-    """
-
-
 def action_title(title: str):
     """Set the display name used when registering the action in Gundi,
     instead of the default derived from the handler function name."""

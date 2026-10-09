@@ -1,7 +1,7 @@
 import json
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pydantic
 
@@ -12,7 +12,6 @@ from gundi_core import schemas
 from gundi_core.events import GundiDelivery
 from gundi_core.schemas.v2 import Integration, LogLevel
 
-from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.batch_progress import BatchProgressStore, decode, fingerprint, headers_digest
 from app.services.errors import (
@@ -36,7 +35,6 @@ from .configurations import (
     DeliverBatchConfig,
     DeliverConfig,
     EndpointSettings,
-    FlushBuffersConfig,
     OutputType,
 )
 from .envelopes import GundiBatchDelivery
@@ -187,13 +185,13 @@ async def _log_delivery_failure(
     )
 
 
-async def _log_missing_url(integration: Integration, action_id: str, output_type: OutputType, records: List[dict]):
+async def _log_stranded(integration: Integration, action_id: str, output_type: OutputType, records: List[dict]):
     await log_action_activity(
         integration_id=str(integration.id),
         action_id=action_id,
         title=(
-            f"Dropping {len(records)} {_label(output_type)}: the type is selected for delivery "
-            f"but has no URL. Set '{OUTPUT_TYPE_TITLES[output_type]}: URL' in the Deliver configuration."
+            f"Dropping {len(records)} buffered {_label(output_type)}: the Deliver configuration "
+            f"no longer has an endpoint for {OUTPUT_TYPE_TITLES[output_type]}."
         ),
         level=LogLevel.ERROR,
         data={"output_type": output_type.value, "gundi_ids": _gundi_ids(records)},
@@ -206,7 +204,7 @@ async def _log_dropped(integration: Integration, action_id: str, payloads: List[
     await log_action_activity(
         integration_id=str(integration.id),
         action_id=action_id,
-        title=f"Dropping {summary}: not a data type selected for delivery.",
+        title=f"Dropping {summary}: the Deliver configuration has no endpoint for this data type.",
         level=LogLevel.INFO,
         data={"payload_types": dict(counts), "gundi_ids": [str(p.gundi_id) for p in payloads]},
     )
@@ -282,9 +280,9 @@ async def _flush_due(
 
 
 async def _drop_buffer(integration: Integration, action_id: str, output_type: OutputType) -> dict:
-    """Empty a buffer whose type no longer has a URL, logging what is dropped."""
+    """Empty a buffer whose type no longer has an endpoint, logging what is dropped."""
     async def drop(records):
-        await _log_missing_url(integration, action_id, output_type, records)
+        await _log_stranded(integration, action_id, output_type, records)
 
     result = await outbound_buffer.flush(
         str(integration.id), output_type.value,
@@ -296,33 +294,43 @@ async def _drop_buffer(integration: Integration, action_id: str, output_type: Ou
 async def _report_buffer_overflow(integration: Integration, action_id: str, output_type: OutputType):
     """ERROR for records the buffer cap dropped, at most once per
     OUTBOUND_OVERFLOW_REPORT_SECONDS, with the count since the last report.
-    Never raises."""
+
+    The count is acknowledged only after the ERROR is published, and only the
+    count it names, so drops are never lost to a failed publish and drops that
+    land meanwhile go into the next report. Never raises.
+    """
     integration_id = str(integration.id)
+    window = dict(
+        integration_id=integration_id, action_id="deliver", source_id=f"buffer-overflow-{output_type.value}",
+    )
     try:
-        if not await outbound_buffer.pending_dropped(integration_id, output_type.value):
+        count = await outbound_buffer.pending_dropped(integration_id, output_type.value)
+        if not count:
             return
         try:
             first_in_window = await state_manager.set_if_absent(
-                integration_id=integration_id, action_id="deliver",
-                source_id=f"buffer-overflow-{output_type.value}",
-                ttl_seconds=settings.OUTBOUND_OVERFLOW_REPORT_SECONDS,
+                **window, ttl_seconds=settings.OUTBOUND_OVERFLOW_REPORT_SECONDS,
             )
         except Exception:
             first_in_window = True  # surface it rather than hide it when the throttle is unavailable
         if not first_in_window:
             return
-        total = await outbound_buffer.take_dropped(integration_id, output_type.value)
-        if total:
+        try:
             await log_action_activity(
                 integration_id=integration_id,
                 action_id=action_id,
                 title=(
-                    f"The {_label(output_type)} buffer is full; dropped {total} of its oldest record(s) "
+                    f"The {_label(output_type)} buffer is full; dropped {count} of its oldest record(s) "
                     f"since the last report. The endpoint has not accepted data for a while."
                 ),
                 level=LogLevel.ERROR,
-                data={"output_type": output_type.value, "dropped": total},
+                data={"output_type": output_type.value, "dropped": count},
             )
+        except Exception:
+            # Unreported: reopen the window so the next flush tries again.
+            await state_manager.delete_state(**window)
+            raise
+        await outbound_buffer.acknowledge_dropped(integration_id, output_type.value, count)
     except Exception as e:
         logger.warning(f"Could not report buffer overflow for integration '{integration_id}': {type(e).__name__}: {e}")
 
@@ -343,6 +351,17 @@ async def action_deliver(
         data: GundiDelivery,
         metadata: dict,
 ):
+    result, flushed_type = await _deliver_payload(integration, action_config, data)
+    if swept := await _sweep_buffers(integration, "deliver", action_config, exclude=flushed_type):
+        result["other_buffers"] = swept
+    return result
+
+
+async def _deliver_payload(
+        integration: Integration, action_config: DeliverConfig, data: GundiDelivery,
+) -> Tuple[dict, Optional[OutputType]]:
+    """Deliver or buffer one payload. Returns the result and the type whose
+    buffer was just flushed, if any, so the sweep can skip it."""
     payload = apply_transformations(
         data.payload,
         data.route_configuration,
@@ -350,22 +369,22 @@ async def action_deliver(
         destination_id=str(integration.id),
     )
     output_type = _OUTPUT_TYPES_BY_PAYLOAD.get(type(payload))
-    if output_type not in action_config.output_types:
+    endpoint = action_config.endpoint_for(output_type) if output_type else None
+    if endpoint is None:
         await _log_dropped(integration, "deliver", [payload])
-        return {"dropped": True, "payload_type": type(payload).__name__}
+        return {"dropped": True, "payload_type": type(payload).__name__}, None
 
-    endpoint = action_config.endpoint_for(output_type)
     record = _serialize(payload)
-    if not endpoint.url:
-        await _log_missing_url(integration, "deliver", output_type, [record])
-        return {"dropped": True, "output_type": output_type.value, "reason": "missing_url"}
 
     if endpoint.batch_mode:
         # Once buffered the record is ours to deliver: a failed flush below must
         # not fail the run, or Pub/Sub would redeliver and buffer it twice.
         pushed = await outbound_buffer.push(str(integration.id), output_type.value, record)
         flushed = await _flush_buffer(integration, "deliver", endpoint)
-        return {"buffered": True, "output_type": output_type.value, "buffer_length": pushed.length, "flush": flushed}
+        return (
+            {"buffered": True, "output_type": output_type.value, "buffer_length": pushed.length, "flush": flushed},
+            output_type,
+        )
 
     try:
         sent = await _send(integration, endpoint, record)
@@ -373,8 +392,8 @@ async def action_deliver(
         if _is_retryable(e):
             raise
         await _log_delivery_failure(integration, "deliver", endpoint, [record], e)
-        return {"delivered": False, "output_type": output_type.value, "error": format_error_message(e)}
-    return {"delivered": sent, "output_type": output_type.value}
+        return {"delivered": False, "output_type": output_type.value, "error": format_error_message(e)}, None
+    return {"delivered": sent, "output_type": output_type.value}, None
 
 
 def _request_plan(integration: Integration, endpoint: EndpointSettings) -> list:
@@ -393,9 +412,6 @@ def _request_plan(integration: Integration, endpoint: EndpointSettings) -> list:
 async def _deliver_bundle_group(
         integration: Integration, batch_id, endpoint: EndpointSettings, records: List[dict],
 ) -> dict:
-    if not endpoint.url:
-        await _log_missing_url(integration, "deliver_batch", endpoint.output_type, records)
-        return {"dropped": len(records), "reason": "missing_url"}
     chunk_size = endpoint.max_batch_size if endpoint.batch_mode else 1
     chunks = list(generate_batches(records, chunk_size))
     progress_args = (batch_id, str(integration.id), endpoint.output_type.value)
@@ -473,49 +489,41 @@ async def action_deliver_batch(
         delivered[output_type.value] = await _deliver_bundle_group(
             integration, data.batch_id, deliver_config.endpoint_for(output_type), records,
         )
-    return {"batch_id": str(data.batch_id), "dropped": len(dropped), "delivered": delivered}
+    result = {"batch_id": str(data.batch_id), "dropped": len(dropped), "delivered": delivered}
+    if swept := await _sweep_buffers(integration, "deliver_batch", deliver_config):
+        result["buffers"] = swept
+    return result
 
 
-async def _warn_invalid_deliver_config(integration: Integration, error: IntegrationConfigurationError):
-    logger.warning(f"flush_buffers skipped for integration '{integration.id}': {error.message}")
-    try:
-        first_in_window = await state_manager.set_if_absent(
-            integration_id=str(integration.id), action_id="flush_buffers",
-            source_id="invalid-deliver-config-warning", ttl_seconds=settings.OUTBOUND_INVALID_CONFIG_WARNING_SECONDS,
-        )
-    except Exception:
-        first_in_window = True  # surface it rather than hide it when the throttle is unavailable
-    if first_in_window:
-        await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="flush_buffers",
-            title=f"Not flushing buffered records: {error.message} Buffered records wait until it is fixed.",
-            level=LogLevel.WARNING,
-        )
-
-
-# No @activity_logger: this fires every minute for every integration of the
-# type, and started/completed events for each run would bury the activity feed.
-@crontab_schedule("* * * * *")
-async def action_flush_buffers(integration: Integration, action_config: FlushBuffersConfig):
-    """Send batch-mode buffers whose oldest record has waited max_wait_seconds,
-    and drain buffers left behind when a type leaves batch mode or delivery."""
-    if not integration.get_action_config("deliver"):
-        return {"skipped": True, "reason": "deliver_not_configured"}
-    try:
-        deliver_config = _get_deliver_config(integration)
-    except IntegrationConfigurationError as e:
-        await _warn_invalid_deliver_config(integration, e)
-        return {"skipped": True, "reason": "invalid_deliver_configuration"}
-    flushed = {}
+async def _sweep_buffers(
+        integration: Integration, action_id: str, deliver_config: DeliverConfig,
+        exclude: Optional[OutputType] = None,
+) -> dict:
+    """Move the integration's buffers along on any delivery, since nothing
+    flushes them on a schedule: flush a batch-mode buffer that is due, drain one
+    whose endpoint left batch mode, drop (logged) one whose type lost its
+    endpoint. Empty and not-yet-due buffers cost one or two reads each. Never
+    raises: a failure here must not fail the delivery that triggered it."""
+    integration_id, swept = str(integration.id), {}
     for output_type in OutputType:
-        endpoint = deliver_config.endpoint_for(output_type)
-        active = output_type in deliver_config.output_types and endpoint.batch_mode
-        if active and endpoint.url:
-            flushed[output_type.value] = await _flush_buffer(integration, "flush_buffers", endpoint)
-        elif await outbound_buffer.length(str(integration.id), output_type.value):
-            if endpoint.url:
-                flushed[output_type.value] = await _flush_buffer(integration, "flush_buffers", endpoint, drain=True)
-            else:
-                flushed[output_type.value] = await _drop_buffer(integration, "flush_buffers", output_type)
-    return {"flushed": flushed}
+        if output_type == exclude:
+            continue
+        try:
+            endpoint = deliver_config.endpoint_for(output_type)
+            if endpoint and endpoint.batch_mode:
+                if await outbound_buffer.is_due(
+                        integration_id, output_type.value, endpoint.max_batch_size, endpoint.max_wait_seconds,
+                ):
+                    swept[output_type.value] = await _flush_buffer(integration, action_id, endpoint)
+            elif await outbound_buffer.length(integration_id, output_type.value):
+                if endpoint:
+                    swept[output_type.value] = await _flush_buffer(integration, action_id, endpoint, drain=True)
+                else:
+                    swept[output_type.value] = await _drop_buffer(integration, action_id, output_type)
+        except Exception as e:
+            logger.warning(
+                f"Could not sweep the {output_type.value} buffer of integration '{integration_id}': "
+                f"{type(e).__name__}: {e}"
+            )
+            swept[output_type.value] = {"error": f"{type(e).__name__}: {e}"}
+    return swept

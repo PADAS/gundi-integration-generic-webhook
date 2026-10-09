@@ -182,3 +182,35 @@ async def test_urls_httpx_cannot_use_are_a_permanent_request_error(url):
     assert not exc_info.value.retryable
     assert "hooks.example.com" in str(exc_info.value)
     assert "secret-path" not in str(exc_info.value) and "token" not in str(exc_info.value)
+
+
+class _EndlessBody(httpx.AsyncByteStream):
+    """A response body that never ends, recording whether anyone read it."""
+
+    def __init__(self):
+        self.chunks_read = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        while True:
+            self.chunks_read += 1
+            yield b"x" * 65536
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status, error", [(200, None), (500, client.EndpointServerError), (400, client.EndpointRejectedError)])
+async def test_the_response_body_is_never_read(status, error):
+    body = _EndlessBody()
+
+    async with _client(lambda request: httpx.Response(status, stream=body)) as http:
+        if error:
+            with pytest.raises(error):
+                await client.send_json(URL, "POST", {}, {}, timeout=5, client=http)
+        else:
+            await client.send_json(URL, "POST", {}, {}, timeout=5, client=http)
+
+    assert body.chunks_read == 0
+    assert body.closed

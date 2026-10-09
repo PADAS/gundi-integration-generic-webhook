@@ -86,7 +86,12 @@ async def send_json(
         timeout: float,
         client: Optional[httpx.AsyncClient] = None,
 ) -> httpx.Response:
-    """Send `body` as JSON and return the 2xx response, or raise an EndpointError."""
+    """Send `body` as JSON and return the 2xx response, or raise an EndpointError.
+
+    The response body is never read (the returned response is closed): the
+    status and headers decide the outcome, and an endpoint may answer with a
+    body of any size.
+    """
     host = _host(url)
     # InvalidURL is not a TransportError and would escape unclassified. Messages
     # name the host only: the exception text quotes the URL.
@@ -102,8 +107,10 @@ async def send_json(
     # Redirects are not followed: the URL was vetted against private addresses
     # before this call, and a redirect target would not have been.
     client = client or httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    response = None
     try:
-        response = await client.request(method, url, headers=dict(headers), json=body, timeout=timeout)
+        request = client.build_request(method, url, headers=dict(headers), json=body, timeout=timeout)
+        response = await client.send(request, stream=True)
     # Before TransportError, which it subclasses: a header value h11 refuses is
     # our request's fault, not the network's.
     except httpx.LocalProtocolError as e:
@@ -116,6 +123,8 @@ async def send_json(
     except httpx.TransportError as e:
         raise EndpointConnectionError(f"Could not reach {host}: {type(e).__name__}") from e
     finally:
+        if response is not None:
+            await response.aclose()
         if owns_client:
             await client.aclose()
 

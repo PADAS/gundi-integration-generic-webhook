@@ -1,14 +1,16 @@
 import json
+import re
 
 import pydantic
 import pytest
 
 from app.actions.configurations import AuthenticateConfig, DeliverConfig, HttpMethod, OutputType
+from app.actions.core import ExecutableActionMixin
 from app.actions.tests.conftest import deliver_config_data
 from app.services.redaction import REDACTED, redact_secrets
 
 
-def test_endpoint_for_reads_the_type_specific_fields():
+def test_endpoint_for_reads_the_types_endpoint():
     config = DeliverConfig.parse_obj(deliver_config_data(
         event_method="PUT", event_jq_filter="{t: .title}", event_batch_mode=True,
         event_max_batch_size=20, event_max_wait_seconds=300,
@@ -25,19 +27,45 @@ def test_endpoint_for_reads_the_type_specific_fields():
     assert (observation_endpoint.method, observation_endpoint.jq_filter, observation_endpoint.batch_mode) == (
         HttpMethod.POST, ".", False,
     )
+    assert config.output_types == [OutputType.OBSERVATION, OutputType.EVENT]
 
 
-def test_a_selected_type_without_a_url_still_parses():
-    # The portal cannot enforce it, and a config that fails to parse would fail
-    # every message; delivery drops those records with an error instead.
-    config = DeliverConfig.parse_obj(deliver_config_data(output_types=["observation", "message"]))
-    assert config.endpoint_for(OutputType.MESSAGE).url is None
+def test_a_type_without_an_endpoint_is_not_delivered():
+    config = DeliverConfig.parse_obj(deliver_config_data(output_types=["message"]))
+    assert config.endpoint_for(OutputType.EVENT) is None
 
 
-def test_a_blank_url_counts_as_missing():
-    config = DeliverConfig.parse_obj(deliver_config_data(event_url="  "))
-    assert config.event_url is None
-    assert config.endpoint_for(OutputType.EVENT).url is None
+def test_an_empty_row_parses_and_delivers_nothing():
+    # cdip creates a {} row for every action when an integration is created.
+    assert DeliverConfig.parse_obj({}).endpoints == []
+
+
+def test_only_one_endpoint_per_data_type():
+    data = {"endpoints": [
+        {"output_type": "event", "url": "https://a.example.com"},
+        {"output_type": "event", "url": "https://b.example.com"},
+    ]}
+    with pytest.raises(pydantic.ValidationError, match="only one endpoint per data type; Events appears more than once"):
+        DeliverConfig.parse_obj(data)
+
+
+@pytest.mark.parametrize("url", ["http://hooks.example.com/x", "", "   ", "hooks.example.com", "ftp://x"])
+def test_endpoint_urls_must_be_https(url):
+    with pytest.raises(pydantic.ValidationError, match="must start with https://"):
+        DeliverConfig.parse_obj({"endpoints": [{"output_type": "event", "url": url}]})
+
+
+def test_the_https_rule_is_in_the_schema_so_the_portal_and_cdip_refuse_it_on_save():
+    url_schema = json.loads(DeliverConfig.schema_json())["definitions"]["Endpoint"]["properties"]["url"]
+    assert url_schema["pattern"] == "^https://"
+    assert url_schema["format"] == "password"
+    for url, accepted in [("https://x.example.com/h", True), ("http://x.example.com/h", False)]:
+        assert bool(re.match(url_schema["pattern"], url)) is accepted
+        try:
+            DeliverConfig.parse_obj({"endpoints": [{"output_type": "event", "url": url}]})
+            assert accepted
+        except pydantic.ValidationError:
+            assert not accepted
 
 
 def test_urls_are_secrets_unwrapped_only_for_delivery():
@@ -46,47 +74,48 @@ def test_urls_are_secrets_unwrapped_only_for_delivery():
 
     assert config.endpoint_for(OutputType.EVENT).url == url
     assert "XXXXSECRET" not in repr(config) and "XXXXSECRET" not in json.dumps(config.dict(), default=str)
-    assert redact_secrets(config.dict(), model=DeliverConfig)["event_url"] == REDACTED
-    assert DeliverConfig.ui_schema()["event_url"]["ui:widget"] == "password"
+    assert redact_secrets(config.dict(), model=DeliverConfig)["endpoints"][1]["url"] == REDACTED
 
 
-def test_unselected_types_need_no_url():
-    config = DeliverConfig.parse_obj({"output_types": ["message"], "message_url": "https://x.example.com/m"})
-    assert config.observation_url is None
-
-
-@pytest.mark.parametrize("overrides", [
-    {"output_types": []},
-    {"output_types": ["observation", "observation"]},
-    {"output_types": ["attachment"]},
-    {"observation_max_batch_size": 0},
-    {"observation_max_wait_seconds": 59},
-    {"observation_method": "DELETE"},
+@pytest.mark.parametrize("endpoint", [
+    {"output_type": "attachment", "url": "https://x.example.com"},
+    {"output_type": "event"},
+    {"output_type": "event", "url": "https://x.example.com", "max_batch_size": 0},
+    {"output_type": "event", "url": "https://x.example.com", "max_wait_seconds": 59},
+    {"output_type": "event", "url": "https://x.example.com", "method": "DELETE"},
 ])
-def test_invalid_values_are_rejected(overrides):
+def test_invalid_endpoints_are_rejected(endpoint):
     with pytest.raises(pydantic.ValidationError):
-        DeliverConfig.parse_obj(deliver_config_data(**overrides))
+        DeliverConfig.parse_obj({"endpoints": [endpoint]})
 
 
-def test_deliver_ui_schema_orders_every_field_and_renders_checkboxes():
+def test_deliver_ui_schema_renders_endpoint_items():
     ui_schema = DeliverConfig.ui_schema()
+    endpoint_schema = json.loads(DeliverConfig.schema_json())["definitions"]["Endpoint"]
+    items = ui_schema["endpoints"]["items"]
+
+    assert ui_schema["ui:order"] == ["endpoints"]
+    # jsonb storage reorders keys, so the item order must be explicit and complete.
+    assert sorted(items["ui:order"]) == sorted(endpoint_schema["properties"])
+    assert items["ui:order"][:2] == ["output_type", "url"]
+    assert items["url"] == {"ui:widget": "password", "ui:placeholder": "https://example.com/webhooks/gundi"}
+    assert items["jq_filter"] == {"ui:widget": "textarea", "ui:options": {"language": "jq"}, "ui:rows": 4}
+
+
+def test_data_type_options_have_readable_labels():
     schema = json.loads(DeliverConfig.schema_json())
-
-    assert ui_schema["output_types"] == {"ui:widget": "checkboxes"}
-    assert ui_schema["event_jq_filter"]["ui:widget"] == "textarea"
-    assert sorted(ui_schema["ui:order"]) == sorted(schema["properties"])
-    assert ui_schema["ui:order"][:3] == ["output_types", "observation_url", "observation_method"]
-    assert schema["properties"]["output_types"]["uniqueItems"] is True
-
-
-def test_output_type_checkboxes_have_readable_labels():
-    items = json.loads(DeliverConfig.schema_json())["properties"]["output_types"]["items"]
-    assert items["oneOf"] == [
+    assert schema["definitions"]["Endpoint"]["properties"]["output_type"]["oneOf"] == [
         {"const": "observation", "title": "Observations"},
         {"const": "event", "title": "Events"},
         {"const": "event_update", "title": "Event Updates"},
         {"const": "message", "title": "Messages"},
     ]
+    assert "OutputType" not in schema["definitions"]
+
+
+def test_auth_has_no_test_connection_button():
+    # The handler cannot probe arbitrary endpoints, so the portal would always say "Valid Credentials".
+    assert not issubclass(AuthenticateConfig, ExecutableActionMixin)
 
 
 def test_auth_header_names_are_validated():

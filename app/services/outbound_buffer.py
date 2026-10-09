@@ -9,7 +9,7 @@ so delivery is at-least-once: a crash between a 2xx and the trim re-sends.
 A buffer is capped (oldest records dropped past the cap) and backs off after
 a transient failure, so an endpoint outage neither grows Redis without bound
 nor gets hit once per incoming record. Drops are counted in a `.dropped` key
-for the caller to report (take_dropped).
+for the caller to report (pending_dropped, then acknowledge_dropped).
 """
 import json
 import logging
@@ -131,7 +131,7 @@ class OutboundBuffer:
 
     async def push(self, integration_id, output_type, record: Any, max_records: Optional[int] = None) -> PushResult:
         """Append a JSON-safe record. Past max_records the oldest records are
-        dropped (and counted for take_dropped); PushResult.dropped says how many.
+        dropped (and counted in `.dropped`); PushResult.dropped says how many.
         While a flush runs the cap is deferred to its release."""
         max_records = max_records or settings.OUTBOUND_BUFFER_MAX_RECORDS
         entry = json.dumps({"enqueued_at": time.time(), "record": record})
@@ -179,17 +179,17 @@ class OutboundBuffer:
         """Records dropped by the cap and not yet taken."""
         return int(await self.db_client.get(_dropped_key(integration_id, output_type)) or 0)
 
-    async def take_dropped(self, integration_id, output_type) -> int:
-        """Records dropped since the last call."""
-        key = _dropped_key(integration_id, output_type)
-        count = int(await self.db_client.get(key) or 0)
-        if count:
-            # Subtract rather than delete: drops counted since the GET stay for the next report.
-            await self.db_client.decrby(key, count)
-        return count
+    async def acknowledge_dropped(self, integration_id, output_type, count: int):
+        """Mark `count` dropped records as reported. Subtracts rather than
+        deletes, so drops counted since they were read stay for the next report."""
+        await self.db_client.decrby(_dropped_key(integration_id, output_type), count)
 
     async def length(self, integration_id, output_type) -> int:
         return await self.db_client.llen(buffer_key(integration_id, output_type))
+
+    async def is_due(self, integration_id, output_type, max_batch_size: int, max_wait_seconds: float) -> bool:
+        """Whether a flush would send now: a full batch, or a head older than max_wait_seconds."""
+        return await self._is_due(buffer_key(integration_id, output_type), max_batch_size, max_wait_seconds)
 
     async def _is_due(self, key: str, max_batch_size: int, max_wait_seconds: float) -> bool:
         length = await self.db_client.llen(key)

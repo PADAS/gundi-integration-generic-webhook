@@ -7,11 +7,8 @@ import pydantic
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 from .core import (
     AuthActionConfiguration,
-    ExecutableActionMixin,
     InternalActionConfiguration,
-    PullActionConfiguration,
     PushActionConfiguration,
-    StoredConfigOptionalMixin,
 )
 
 # RFC 9110 field-name token.
@@ -58,7 +55,7 @@ class CustomHeader(pydantic.BaseModel):
         return _clean_header_value(v, "Header Value")
 
 
-class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
+class AuthenticateConfig(AuthActionConfiguration):
     api_key: Optional[pydantic.SecretStr] = FieldWithUIOptions(
         None,
         title="API Key",
@@ -130,9 +127,9 @@ class HttpMethod(str, Enum):
 
 
 class EndpointSettings(pydantic.BaseModel):
-    """Where and how one output type is delivered, read off DeliverConfig's flat fields."""
+    """An Endpoint as the handlers use it: the URL unwrapped."""
     output_type: OutputType
-    url: Optional[str]  # None when the portal saved a selected type without one
+    url: str
     method: HttpMethod
     jq_filter: str
     batch_mode: bool
@@ -140,138 +137,116 @@ class EndpointSettings(pydantic.BaseModel):
     max_wait_seconds: int
 
 
-def _url_field(t: OutputType):
-    # Secret because webhook URLs often are credentials (Slack-style hook
-    # paths, ?token=...), and this keeps them out of activity-log config data.
-    return FieldWithUIOptions(
-        None,
-        title=f"{OUTPUT_TYPE_TITLES[t]}: URL",
-        description=(
-            "HTTPS endpoint that receives this data type. Required when the type is selected above: "
-            "without it, records of this type are dropped and an error is logged. Records buffered "
-            "while the type was selected are still sent here after it is deselected, if a URL is set."
-        ),
+_OUTPUT_TYPE_ONE_OF = [{"const": t.value, "title": OUTPUT_TYPE_TITLES[t]} for t in OutputType]
+_URL_PATTERN = "^https://"
+
+
+class Endpoint(pydantic.BaseModel):
+    output_type: OutputType = pydantic.Field(..., title="Data Type")
+    # Secret because webhook URLs are often credentials (Slack-style hook paths,
+    # ?token=...); this keeps them out of activity-log config data. The pattern
+    # lets the portal and cdip refuse a non-https URL on save.
+    url: pydantic.SecretStr = FieldWithUIOptions(
+        ...,
+        title="URL",
+        description="HTTPS endpoint that receives this data type.",
+        pattern=_URL_PATTERN,
         ui_options=UIOptions(widget="password", placeholder="https://example.com/webhooks/gundi"),
     )
-
-
-def _method_field(t: OutputType):
-    return pydantic.Field(HttpMethod.POST, title=f"{OUTPUT_TYPE_TITLES[t]}: HTTP Method")
-
-
-def _jq_field(t: OutputType):
-    return FieldWithUIOptions(
+    method: HttpMethod = pydantic.Field(HttpMethod.POST, title="HTTP Method")
+    jq_filter: str = FieldWithUIOptions(
         ".",
-        title=f"{OUTPUT_TYPE_TITLES[t]}: JQ Filter",
+        title="JQ Filter",
         description=(
-            "Shapes the request body. Input is one record, or the array of records in batch mode. "
-            "No output (or null) skips the request, one output is the body, several are sent as a JSON array. "
-            "In batch mode, a filter that fails on any record drops the whole batch (logged as an error)."
+            "Shapes the request body. Input: one record, or an array of records in batch mode. "
+            "No output (or null) skips the request; several outputs are sent as a JSON array. "
+            "In batch mode, a filter that fails on any record drops the whole batch."
         ),
         ui_options=UIOptions(widget="textarea", rows=4),
     )
-
-
-def _batch_mode_field(t: OutputType):
-    return pydantic.Field(
-        False,
-        title=f"{OUTPUT_TYPE_TITLES[t]}: Batch Mode",
-        description="Send records in groups instead of one request per record.",
+    batch_mode: bool = pydantic.Field(
+        False, title="Batch Mode", description="Send records in groups instead of one request per record.",
+    )
+    max_batch_size: int = pydantic.Field(
+        100, ge=1, title="Max Batch Size", description="Batch mode: most records in one request.",
+    )
+    max_wait_seconds: int = pydantic.Field(
+        60, ge=60, title="Max Wait (seconds)",
+        description=(
+            "Batch mode: a partial batch is sent with the next record that arrives for this integration "
+            "after its oldest record has waited this long."
+        ),
     )
 
+    @pydantic.validator("url", pre=True)
+    def https_url(cls, v):
+        raw = v.get_secret_value() if isinstance(v, pydantic.SecretStr) else str(v or "")
+        raw = raw.strip()
+        if not raw.startswith("https://"):
+            raise ValueError("must start with https://")
+        return raw
 
-def _max_batch_size_field(t: OutputType):
-    return pydantic.Field(
-        100, ge=1,
-        title=f"{OUTPUT_TYPE_TITLES[t]}: Max Batch Size",
-        description="Batch mode: most records sent in one request.",
-    )
-
-
-def _max_wait_field(t: OutputType):
-    # Buffers are flushed by a once-a-minute schedule, so a shorter wait could not be honoured.
-    return pydantic.Field(
-        60, ge=60,
-        title=f"{OUTPUT_TYPE_TITLES[t]}: Max Wait (seconds)",
-        description="Batch mode: a partial batch is sent once its oldest record has waited this long.",
-    )
-
-
-_ENDPOINT_FIELDS = ("url", "method", "jq_filter", "batch_mode", "max_batch_size", "max_wait_seconds")
+    def settings(self) -> EndpointSettings:
+        return EndpointSettings(**{**self.dict(), "url": self.url.get_secret_value()})
 
 
 class DeliverConfig(PushActionConfiguration):
-    output_types: List[OutputType] = FieldWithUIOptions(
-        ...,
-        min_items=1,
-        unique_items=True,
-        title="Data Types to Deliver",
-        description="Data types sent to the endpoints below. Anything else routed to this integration is dropped.",
-        ui_options=UIOptions(widget="checkboxes"),
+    endpoints: List[Endpoint] = pydantic.Field(
+        [],
+        title="Endpoints",
+        description="One per data type to deliver. Data types without an endpoint are dropped.",
     )
 
-    observation_url: Optional[pydantic.SecretStr] = _url_field(OutputType.OBSERVATION)
-    observation_method: HttpMethod = _method_field(OutputType.OBSERVATION)
-    observation_jq_filter: str = _jq_field(OutputType.OBSERVATION)
-    observation_batch_mode: bool = _batch_mode_field(OutputType.OBSERVATION)
-    observation_max_batch_size: int = _max_batch_size_field(OutputType.OBSERVATION)
-    observation_max_wait_seconds: int = _max_wait_field(OutputType.OBSERVATION)
+    @pydantic.validator("endpoints")
+    def one_endpoint_per_type(cls, v):
+        seen = set()
+        for endpoint in v:
+            if endpoint.output_type in seen:
+                raise ValueError(
+                    f"only one endpoint per data type; {OUTPUT_TYPE_TITLES[endpoint.output_type]} appears more than once"
+                )
+            seen.add(endpoint.output_type)
+        return v
 
-    event_url: Optional[pydantic.SecretStr] = _url_field(OutputType.EVENT)
-    event_method: HttpMethod = _method_field(OutputType.EVENT)
-    event_jq_filter: str = _jq_field(OutputType.EVENT)
-    event_batch_mode: bool = _batch_mode_field(OutputType.EVENT)
-    event_max_batch_size: int = _max_batch_size_field(OutputType.EVENT)
-    event_max_wait_seconds: int = _max_wait_field(OutputType.EVENT)
+    @property
+    def output_types(self) -> List[OutputType]:
+        return [endpoint.output_type for endpoint in self.endpoints]
 
-    event_update_url: Optional[pydantic.SecretStr] = _url_field(OutputType.EVENT_UPDATE)
-    event_update_method: HttpMethod = _method_field(OutputType.EVENT_UPDATE)
-    event_update_jq_filter: str = _jq_field(OutputType.EVENT_UPDATE)
-    event_update_batch_mode: bool = _batch_mode_field(OutputType.EVENT_UPDATE)
-    event_update_max_batch_size: int = _max_batch_size_field(OutputType.EVENT_UPDATE)
-    event_update_max_wait_seconds: int = _max_wait_field(OutputType.EVENT_UPDATE)
-
-    message_url: Optional[pydantic.SecretStr] = _url_field(OutputType.MESSAGE)
-    message_method: HttpMethod = _method_field(OutputType.MESSAGE)
-    message_jq_filter: str = _jq_field(OutputType.MESSAGE)
-    message_batch_mode: bool = _batch_mode_field(OutputType.MESSAGE)
-    message_max_batch_size: int = _max_batch_size_field(OutputType.MESSAGE)
-    message_max_wait_seconds: int = _max_wait_field(OutputType.MESSAGE)
-
-    # A missing URL for a selected type is not a validation error: the portal
-    # form cannot enforce it, and a config that fails to parse fails every
-    # message routed here. Delivery drops such records with an error instead.
-    @pydantic.validator("observation_url", "event_url", "event_update_url", "message_url", pre=True)
-    def blank_url_is_unset(cls, v):
-        if isinstance(v, pydantic.SecretStr):
-            v = v.get_secret_value()
-        return (v or "").strip() or None
+    def endpoint_for(self, output_type: OutputType) -> Optional[EndpointSettings]:
+        """The type's endpoint, or None when the type is not delivered."""
+        for endpoint in self.endpoints:
+            if endpoint.output_type == output_type:
+                return endpoint.settings()
+        return None
 
     @classmethod
     def schema(cls, **kwargs):
         schema = super().schema(**kwargs)
-        # Checkbox labels: rjsf reads options from `oneOf` const/title.
-        schema["properties"]["output_types"]["items"] = {
-            "type": "string",
-            "oneOf": [{"const": t.value, "title": OUTPUT_TYPE_TITLES[t]} for t in OutputType],
+        definitions = schema.get("definitions", {})
+        # Readable select options: rjsf reads them from `oneOf` const/title.
+        definitions["Endpoint"]["properties"]["output_type"] = {
+            "title": "Data Type", "type": "string", "oneOf": _OUTPUT_TYPE_ONE_OF,
         }
-        schema.get("definitions", {}).pop("OutputType", None)
+        definitions.pop("OutputType", None)
         return schema
-
-    def endpoint_for(self, output_type: OutputType) -> EndpointSettings:
-        prefix = OutputType(output_type).value
-        values = {name: getattr(self, f"{prefix}_{name}") for name in _ENDPOINT_FIELDS}
-        values["url"] = values["url"].get_secret_value() if values["url"] else None
-        return EndpointSettings(output_type=output_type, **values)
 
     @classmethod
     def ui_schema(cls, *args, **kwargs):
         base = super().ui_schema(*args, **kwargs)
-        # The portal stores schemas in jsonb, which reorders object keys, so the
-        # form follows this list rather than the field declaration order.
-        base["ui:order"] = ["output_types"] + [
-            f"{t.value}_{name}" for t in OutputType for name in _ENDPOINT_FIELDS
-        ]
+        # Nested objects lose their key order in the portal's jsonb storage, so
+        # array items carry their own ui:order (as custom_headers does).
+        endpoint_fields = Endpoint.__fields__
+        base["ui:order"] = ["endpoints"]
+        base["endpoints"] = {
+            "items": {
+                "ui:order": list(endpoint_fields),
+                **{name: field.field_info.ui_schema() for name, field in endpoint_fields.items()
+                   if getattr(field.field_info, "ui_options", None)},
+            },
+        }
+        # The portal's jq editor keys off this option on a textarea. A "jq"
+        # widget name would make rjsf throw in portals that lack it.
+        base["endpoints"]["items"]["jq_filter"]["ui:options"] = {"language": "jq"}
         return base
 
 
@@ -284,8 +259,3 @@ class DeliverBatchConfig(PushActionConfiguration, InternalActionConfiguration):
     without a stored config row, which would otherwise answer 404 and leave
     Pub/Sub redelivering the bundle.
     """
-
-
-class FlushBuffersConfig(StoredConfigOptionalMixin, PullActionConfiguration):
-    """No fields of its own: what to flush follows from the `deliver` config,
-    so it runs for every integration without a saved Flush Buffers form."""

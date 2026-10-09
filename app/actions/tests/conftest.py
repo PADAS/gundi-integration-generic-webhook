@@ -47,14 +47,33 @@ def make_integration(deliver=None, auth=None):
     })
 
 
-def deliver_config_data(**overrides):
-    data = {
-        "output_types": ["observation", "event"],
-        "observation_url": "https://hooks.example.com/observations",
-        "event_url": "https://hooks.example.com/events",
-    }
-    data.update(overrides)
-    return data
+DEFAULT_URLS = {
+    "observation": "https://hooks.example.com/observations",
+    "event": "https://hooks.example.com/events",
+    "event_update": "https://hooks.example.com/event_update",
+    "message": "https://hooks.example.com/message",
+}
+_ENDPOINT_FIELDS = ("url", "method", "jq_filter", "batch_mode", "max_batch_size", "max_wait_seconds")
+
+
+def deliver_config_data(output_types=("observation", "event"), **overrides):
+    """Deliver config data with one endpoint per type in output_types.
+
+    Overrides are named `<type>_<field>` (e.g. event_batch_mode=True); one that
+    names no configured endpoint field raises, so a typo cannot pass silently.
+    """
+    endpoints, used = [], set()
+    for output_type in output_types:
+        endpoint = {"output_type": output_type, "url": DEFAULT_URLS[output_type]}
+        for field in _ENDPOINT_FIELDS:
+            key = f"{output_type}_{field}"
+            if key in overrides:
+                endpoint[field] = overrides[key]
+                used.add(key)
+        endpoints.append(endpoint)
+    if unused := set(overrides) - used:
+        raise TypeError(f"Overrides for no configured endpoint field: {sorted(unused)}")
+    return {"endpoints": endpoints}
 
 
 AUTH_CONFIG_DATA = {"api_key": "s3cret", "custom_headers": [{"name": "X-Tenant", "value": "acme"}]}
@@ -118,6 +137,7 @@ def outbound_env(mocker, fake_redis, published_events):
     mocker.patch.object(handlers, "batch_progress", BatchProgressStore(db_client=fake_redis))
     state_manager = mocker.MagicMock()
     state_manager.set_if_absent = mocker.AsyncMock(side_effect=[True, False, False])
+    state_manager.delete_state = mocker.AsyncMock()
     mocker.patch.object(handlers, "state_manager", state_manager)
     mocker.patch("app.services.url_policy._resolve_addresses", mocker.AsyncMock(return_value=[PUBLIC_ADDRESS]))
     send_json = mocker.patch("app.actions.client.send_json", mocker.AsyncMock())

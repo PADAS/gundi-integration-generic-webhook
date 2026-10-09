@@ -15,12 +15,18 @@ the user configures. It needs the destination integration to have
 | `auth` | auth | portal | API key and custom headers sent on every request |
 | `deliver` | push | `GundiDelivery` | Delivers one payload (or buffers it in batch mode) |
 | `deliver_batch` | push, internal | `GundiBatchDelivery` | Delivers a bundle. Uses the `deliver` config; not registered, so no form of its own |
-| `flush_buffers` | pull | every minute | Sends due batch-mode buffers; drains buffers left behind by config changes |
 
 Code: `app/actions/handlers.py`, models in `app/actions/configurations.py`,
 HTTP client in `app/actions/client.py`, bundle envelope in
 `app/actions/envelopes.py`, and in `app/services/`: `jq_transform.py`,
 `outbound_buffer.py` and `batch_progress.py`.
+
+There is no scheduled action: buffers are flushed inline by the deliveries
+(see [Batch mode](#batch-mode-deliver--buffer)). A scheduled action would not
+help anyway: cdip schedules pull actions only for integrations used as
+providers, so it would never run for a destination-only integration. It would
+also run every minute for every inbound webhook provider, and make the type
+look like a data source in the portal.
 
 `deliver` and `deliver_batch` publish activity events on **errors only**.
 cdip-routing sends one `GundiDelivery` per record, so started/completed
@@ -40,38 +46,36 @@ events would add two feed entries per record.
   stripped and must be ASCII with no line breaks or other control
   characters. These are rejected when saved, because they could never be
   sent.
+- There is no "Test Connection" button (the action is not executable): an
+  endpoint can only be tested by sending it data. The `auth` action still
+  exists, following the template's convention.
 
 **Deliver**
 
-- `output_types`: one or more of Observations, Events, Event Updates,
-  Messages (stored as `observation`, `event`, `event_update`, `message`).
-  Anything else routed here (attachments, unselected types) is dropped with
-  an INFO entry in the activity log.
-- For each type `<t>` (form fields are flat because the portal renders them more reliably):
-  - `<t>_url` (secret, password widget): webhook URLs are often credentials
-    (Slack-style hook paths, `?token=`), so they never appear in activity-log
-    config data.
-    - Must be `https` and resolve to public addresses only
+- `endpoints`: a list, one item per data type to deliver. A type with no
+  endpoint is not delivered. Records of that type, and anything else routed
+  here (e.g. attachments), are dropped with an INFO entry in the activity
+  log. An empty list, or the `{}` row cdip creates for every action, delivers
+  nothing. Each item has:
+  - `output_type`: Observations, Events, Event Updates or Messages (stored as
+    `observation`, `event`, `event_update`, `message`). **Only one endpoint per
+    data type**: a duplicate is rejected on save.
+  - `url` (required, secret, password widget): webhook URLs are often
+    credentials (Slack-style hook paths, `?token=`), so they never appear in
+    activity-log config data.
+    - The JSON schema has `pattern: "^https://"`, so the portal and cdip refuse
+      a non-https URL on save, and the model applies the same rule.
+    - At send time the URL must also resolve to public addresses only
       (`app/services/url_policy.py`). It is checked before every request, and
-      redirects are not followed. Set `OUTBOUND_URL_ALLOWLIST` to restrict hosts
-      further.
-    - A selected type with **no URL is not a validation error**: the portal form
-      cannot enforce the rule, and a config that fails to parse would fail every
-      message routed here. Instead, records of that type are dropped with an
-      ERROR naming the missing field.
-  - `<t>_method`: `POST` (default) or `PUT`.
-  - `<t>_jq_filter`: default `.`.
-  - `<t>_batch_mode` (default off), `<t>_max_batch_size` (default 100, ≥ 1),
-    `<t>_max_wait_seconds` (default 60, ≥ 60, since the flush runs once a minute).
+      redirects are not followed. Set `OUTBOUND_URL_ALLOWLIST` to restrict
+      hosts further.
+  - `method`: `POST` (default) or `PUT`.
+  - `jq_filter`: default `.`.
+  - `batch_mode` (default off), `max_batch_size` (default 100, ≥ 1),
+    `max_wait_seconds` (default 60, ≥ 60).
 
-**Flush Buffers**: only the standard `run_on_schedule` toggle, and nothing to
-fill in. It runs for every integration of the type, **whether or not this form
-was saved**. Its config model mixes in `StoredConfigOptionalMixin`
-(`app/actions/core.py`). The runner then executes the action with the model's
-defaults when no row is stored, instead of skipping it like other scheduled
-pulls; this is a one-line, opt-in hook in `action_runner.py`. A stored row
-still applies, so `run_on_schedule = false` pauses it. Integrations without a
-`deliver` config return at once.
+  The list renders like `custom_headers`: an Add button, with an explicit
+  `ui:order` inside the items.
 
 Settings (`app/settings/integration.py`):
 
@@ -85,7 +89,6 @@ Settings (`app/settings/integration.py`):
 | `OUTBOUND_BACKOFF_INITIAL_SECONDS` | 30 |
 | `OUTBOUND_BACKOFF_MAX_SECONDS` | 900; must be ≥ the initial backoff |
 | `OUTBOUND_OVERFLOW_REPORT_SECONDS` | 600: buffer-overflow ERRORs at most this often |
-| `OUTBOUND_INVALID_CONFIG_WARNING_SECONDS` | 3600: invalid-deliver-config WARNINGs at most this often |
 
 Every count and duration must be a positive integer, and the timeout a
 positive number. `validate_outbound_settings` checks them at import, together
@@ -127,7 +130,6 @@ is the single source of truth for HTTP outcomes):
 | 401, 403 | auth | permanent |
 | other 4xx, 3xx (the message names the redirect target host) | bad response | permanent |
 | URL refused by policy, bad filter, invalid auth config, header the client cannot send | configuration | permanent |
-| selected type with no URL | | dropped, ERROR |
 
 **Retryable** failures reach the runner as an exception. `/push-data` then
 answers non-2xx, and Pub/Sub redelivers with backoff.
@@ -150,10 +152,19 @@ which can produce a duplicate.
 Each record is appended to a Redis list per (integration, output type),
 stamped with its enqueue time. A flush is due when the buffer holds
 `max_batch_size` records or its oldest record is older than
-`max_wait_seconds`. It runs:
+`max_wait_seconds`. Flushes run **only inline**, when a record arrives for
+the integration:
 
-- inline, after every `deliver` into that buffer;
-- every minute, from `flush_buffers`.
+- after every `deliver` into a buffer, for that buffer;
+- after every `deliver` or `deliver_batch` of any type, a sweep of the
+  integration's other buffers. It does one or two cheap reads per buffer
+  (length, then the age of the oldest record), and only flushes what is due.
+  The sweep respects each buffer's backoff and lock. A failure in it is
+  logged and never fails the delivery that triggered it.
+
+**A quiet integration may hold a partial batch until the next record arrives
+for that integration**, however long `max_wait_seconds` has passed. Nothing
+flushes a buffer on a timer. See follow-up 5.
 
 A flush holds a per-buffer lock (`SET NX EX` with a token, released by a
 token-checked script). It reads up to `max_batch_size` records, sends them,
@@ -168,8 +179,8 @@ the `deliver` run, since a redelivery would buffer the record twice.
 - **Backoff**: a transient failure leaves the batch at the head and backs the
   buffer off. The delay is the 429's Retry-After (capped at 24 h), or else
   `OUTBOUND_BACKOFF_INITIAL_SECONDS` doubled per consecutive failure, up to
-  `OUTBOUND_BACKOFF_MAX_SECONDS`. Inline and scheduled flushes skip the buffer
-  until the delay passes. The WARNING ("will retry in N s") is published once
+  `OUTBOUND_BACKOFF_MAX_SECONDS`. Flushes and sweeps skip the buffer until the
+  delay passes. The WARNING ("will retry in N s") is published once
   per failed attempt, so at most once per backoff window. A successful batch
   resets the streak.
 - **Cap**: past `OUTBOUND_BUFFER_MAX_RECORDS` the oldest records are dropped.
@@ -182,13 +193,13 @@ the `deliver` run, since a redelivery would buffer the record twice.
     holding its token, whether it succeeded or failed.
   - Both count what they drop in the buffer's `.dropped` key, and the report
     takes that count.
-- **Left-behind buffers**: when a type leaves batch mode or is deselected,
-  `flush_buffers` drains what is left. It sends the records with the type's
-  current settings if it still has a URL, even when the type was deselected:
-  the records were accepted while it was selected. Otherwise it drops them with
-  an ERROR. In single mode the drain reads and trims one record at a time, so a
-  failure mid-drain never re-sends records already delivered. An invalid `deliver` config
-  stops flushing; that is logged as a WARNING at most once an hour.
+- **Left-behind buffers**: when a type leaves batch mode, the sweep drains
+  what is left with the endpoint's current settings. The drain reads
+  and trims one record at a time, so a failure mid-drain never re-sends
+  records already delivered. When a type's endpoint is removed, there is no
+  URL to send to, so its buffered records are dropped with an ERROR listing
+  their `gundi_id`s. While the `deliver` config is invalid, no delivery
+  runs, so no buffer moves.
 
 ### Bundles (`deliver_batch`)
 
@@ -256,7 +267,12 @@ the redelivered bundle resumes at the failed request. Records expire after
      non-retryable failures the way `/` already does (`_should_redeliver`), or
      route them to a dead-letter topic. This connector avoids the cases it
      controls; that one is the runner's.
-   - Upstream `StoredConfigOptionalMixin` and its runner hook, so forks stay mergeable.
+5. **Runner-wide scheduled flush sweep**: something that flushes aged buffers
+   without waiting for traffic, so a quiet integration's partial batch is
+   still sent after `max_wait_seconds`. Per-integration pull actions do not
+   fit, because cdip schedules them only for providers. One option is a
+   single runner-level periodic job that scans the `outbound_buffer.*` keys
+   and runs the same sweep.
 
 ## Known limitations (not addressed in the POC)
 

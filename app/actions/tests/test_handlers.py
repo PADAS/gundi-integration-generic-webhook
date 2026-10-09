@@ -3,9 +3,10 @@ import time
 
 import pytest
 from gundi_core.events import GundiDelivery, LogLevel
+from redis.exceptions import RedisError
 
 from app.actions import client, handlers
-from app.actions.configurations import AuthenticateConfig, DeliverBatchConfig, DeliverConfig, FlushBuffersConfig
+from app.actions.configurations import AuthenticateConfig, DeliverBatchConfig, DeliverConfig, OutputType
 from app.actions.envelopes import GundiBatchDelivery
 from app.actions.tests.conftest import (
     AUTH_CONFIG_DATA, PROVIDER, attachment, deliver_config_data, event, make_integration, observation, text_message,
@@ -13,6 +14,13 @@ from app.actions.tests.conftest import (
 from app import settings
 from app.services.errors import IntegrationBadResponseError, IntegrationConfigurationError, IntegrationConnectionError
 from app.services.outbound_buffer import buffer_key
+
+
+# Fails to parse: the portal cannot save it, but a hand-edited row could hold it.
+DUPLICATE_ENDPOINTS = {"endpoints": [
+    {"output_type": "event", "url": "https://a.example.com"},
+    {"output_type": "event", "url": "https://b.example.com"},
+]}
 
 
 def _delivery(payload):
@@ -255,7 +263,7 @@ async def test_bundle_groups_by_type_and_drops_the_rest(outbound_env):
         "https://hooks.example.com/observations",
     ]
     assert result["dropped"] == 2
-    assert _titles(log_activity) == ["Dropping 1 Attachment, 1 TextMessage: not a data type selected for delivery."]
+    assert _titles(log_activity) == ["Dropping 1 Attachment, 1 TextMessage: the Deliver configuration has no endpoint for this data type."]
 
 
 @pytest.mark.asyncio
@@ -338,7 +346,7 @@ async def test_permanent_failure_is_logged_and_the_rest_continues(outbound_env):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deliver", [None, {"output_types": []}])
+@pytest.mark.parametrize("deliver", [None, DUPLICATE_ENDPOINTS])
 async def test_bundle_without_a_usable_deliver_config_is_logged_and_acked(outbound_env, deliver):
     send_json, log_activity = outbound_env
 
@@ -353,7 +361,16 @@ async def test_bundle_without_a_usable_deliver_config_is_logged_and_acked(outbou
     assert log_activity.call_args.kwargs["data"]["batch_id"] == "batch-1"
 
 
-# action_flush_buffers
+# Buffers swept by any delivery (there is no scheduled flush)
+
+async def _sweep(integration):
+    """Deliver a record no endpoint takes (an attachment): it is dropped, and the
+    delivery sweeps the integration's buffers, as any delivery does."""
+    config = DeliverConfig.parse_obj(integration.get_action_config("deliver").data)
+    return await handlers.action_deliver(
+        integration=integration, action_config=config, data=_delivery(attachment(9)), metadata={},
+    )
+
 
 async def _push_aged(fake_redis, records, age_seconds):
     key = buffer_key(make_integration().id, "observation")
@@ -363,86 +380,56 @@ async def _push_aged(fake_redis, records, age_seconds):
 
 
 @pytest.mark.asyncio
-async def test_flush_sends_aged_partial_buffers(outbound_env, fake_redis):
+async def test_a_delivery_flushes_aged_partial_buffers_of_other_types(outbound_env, fake_redis):
     send_json, _ = outbound_env
     key = await _push_aged(fake_redis, [observation(0), observation(1)], age_seconds=120)
     integration = make_integration(deliver=deliver_config_data(
         observation_batch_mode=True, observation_max_batch_size=10, observation_max_wait_seconds=60,
     ))
 
-    result = await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    result = await _sweep(integration)
 
-    assert result["flushed"]["observation"]["records_sent"] == 2
+    assert result["other_buffers"]["observation"]["records_sent"] == 2
     assert len(send_json.call_args.kwargs["body"]) == 2
     assert fake_redis.lists[key] == []
 
 
 @pytest.mark.asyncio
-async def test_flush_leaves_young_buffers(outbound_env, fake_redis):
+async def test_a_delivery_leaves_young_buffers(outbound_env, fake_redis):
     send_json, _ = outbound_env
     key = await _push_aged(fake_redis, [observation(0)], age_seconds=10)
     integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
 
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
 
     send_json.assert_not_called()
     assert len(fake_redis.lists[key]) == 1
 
 
 @pytest.mark.asyncio
-async def test_flush_skips_a_buffer_another_flusher_holds(outbound_env, fake_redis):
+async def test_the_sweep_skips_a_buffer_another_flusher_holds(outbound_env, fake_redis):
     send_json, _ = outbound_env
     key = await _push_aged(fake_redis, [observation(0)], age_seconds=120)
     await fake_redis.set(f"{key}.lock", "other", nx=True, ex=300)
     integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
 
-    result = await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    result = await _sweep(integration)
 
-    assert result["flushed"]["observation"]["locked_out"] is True
+    assert result["other_buffers"]["observation"]["locked_out"] is True
     send_json.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_flush_drops_a_permanently_rejected_batch(outbound_env, fake_redis):
+async def test_the_sweep_drops_a_permanently_rejected_batch(outbound_env, fake_redis):
     send_json, log_activity = outbound_env
     send_json.side_effect = client.EndpointRejectedError("HTTP 400", 400)
     key = await _push_aged(fake_redis, [observation(0)], age_seconds=120)
     integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
 
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
 
     assert fake_redis.lists[key] == []
     assert log_activity.call_args.kwargs["level"] == LogLevel.ERROR
-
-
-@pytest.mark.asyncio
-async def test_flush_is_a_quiet_no_op_without_a_deliver_config(outbound_env):
-    send_json, log_activity = outbound_env
-
-    result = await handlers.action_flush_buffers(integration=make_integration(), action_config=FlushBuffersConfig())
-
-    assert result == {"skipped": True, "reason": "deliver_not_configured"}
-    send_json.assert_not_called()
-    log_activity.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_flush_warns_about_an_invalid_deliver_config_at_most_once_an_hour(outbound_env):
-    send_json, log_activity = outbound_env
-    integration = make_integration(deliver={"output_types": []})
-
-    for _ in range(3):
-        result = await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
-
-    assert result == {"skipped": True, "reason": "invalid_deliver_configuration"}
-    send_json.assert_not_called()
-    assert log_activity.call_count == 1
-    assert log_activity.call_args.kwargs["level"] == LogLevel.WARNING
-
-
-def test_flush_runs_every_minute():
-    schedule = handlers.action_flush_buffers.crontab_schedule
-    assert (schedule.minute, schedule.hour) == ("*", "*")
 
 
 def test_retryability_is_set_where_the_failure_is_raised():
@@ -466,35 +453,7 @@ async def test_event_updates_and_messages_go_to_their_own_endpoints(outbound_env
     assert send_json.call_args.kwargs["url"] == url
 
 
-# Missing URLs, request errors, DNS failures
-
-@pytest.mark.asyncio
-async def test_deliver_drops_a_selected_type_without_a_url(outbound_env):
-    send_json, log_activity = outbound_env
-
-    result = await _deliver(text_message(1), output_types=["message"])
-
-    assert result == {"dropped": True, "output_type": "message", "reason": "missing_url"}
-    send_json.assert_not_called()
-    assert log_activity.call_args.kwargs["level"] == LogLevel.ERROR
-    assert "Messages: URL" in log_activity.call_args.kwargs["title"]
-
-
-@pytest.mark.asyncio
-async def test_bundle_drops_only_the_types_without_a_url(outbound_env):
-    send_json, log_activity = outbound_env
-
-    result = await _deliver_batch(
-        _bundle([event(0), text_message(0), text_message(1)]), output_types=["event", "message"],
-    )
-
-    assert result["delivered"]["message"] == {"dropped": 2, "reason": "missing_url"}
-    assert result["delivered"]["event"]["sent"] == 1
-    assert send_json.call_count == 1
-    assert log_activity.call_args.kwargs["data"]["gundi_ids"] == [
-        "20000000-0000-0000-0000-000000000000", "20000000-0000-0000-0000-000000000001",
-    ]
-
+# Request errors, DNS failures
 
 @pytest.mark.asyncio
 async def test_a_dns_failure_is_retried_not_dropped(outbound_env, mocker):
@@ -620,40 +579,26 @@ async def test_a_full_buffer_drops_its_oldest_records_with_an_error(outbound_env
 # Buffers left behind by a config change
 
 @pytest.mark.asyncio
-async def test_flush_drains_a_buffer_whose_type_left_batch_mode_one_record_per_request(outbound_env, fake_redis):
+async def test_the_sweep_drains_a_buffer_whose_type_left_batch_mode_one_record_per_request(outbound_env, fake_redis):
     send_json, _ = outbound_env
     key = await _push_aged(fake_redis, [observation(0), observation(1)], age_seconds=1)
     integration = make_integration(deliver=deliver_config_data(observation_jq_filter="{id: .external_source_id}"))
 
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
 
     assert _bodies(send_json) == [{"id": "collar-0"}, {"id": "collar-1"}]
     assert fake_redis.lists[key] == []
 
 
 @pytest.mark.asyncio
-async def test_flush_drains_a_deselected_type_that_still_has_a_url(outbound_env, fake_redis):
-    send_json, _ = outbound_env
-    key = await _push_aged(fake_redis, [observation(0)], age_seconds=1)
-    integration = make_integration(deliver=deliver_config_data(
-        output_types=["event"], observation_batch_mode=True,
-    ))
-
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
-
-    assert len(send_json.call_args.kwargs["body"]) == 1
-    assert fake_redis.lists[key] == []
-
-
-@pytest.mark.asyncio
-async def test_flush_drops_a_left_behind_buffer_with_no_url_and_says_so(outbound_env, fake_redis):
+async def test_the_sweep_drops_a_buffer_whose_type_lost_its_endpoint_and_says_so(outbound_env, fake_redis):
     send_json, log_activity = outbound_env
     key = await _push_aged(fake_redis, [observation(0), observation(1)], age_seconds=1)
-    integration = make_integration(deliver={"output_types": ["event"], "event_url": "https://hooks.example.com/e"})
+    integration = make_integration(deliver=deliver_config_data(output_types=["event"]))
 
-    result = await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    result = await _sweep(integration)
 
-    assert result["flushed"]["observation"]["dropped"] is True
+    assert result["other_buffers"]["observation"]["dropped"] is True
     send_json.assert_not_called()
     assert fake_redis.lists[key] == []
     assert log_activity.call_args.kwargs["level"] == LogLevel.ERROR
@@ -667,9 +612,9 @@ async def test_a_failure_mid_drain_does_not_resend_delivered_records(outbound_en
     integration = make_integration(deliver=deliver_config_data(observation_jq_filter=".external_source_id"))
     send_json.side_effect = [None, None, None, client.EndpointServerError("HTTP 503", 503), None, None]
 
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
     await handlers.outbound_buffer.clear_backoff(str(integration.id), "observation")  # the window has passed
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
 
     assert _bodies(send_json) == ["collar-0", "collar-1", "collar-2", "collar-3", "collar-3", "collar-4"]
     assert fake_redis.lists[key] == []
@@ -706,7 +651,7 @@ async def test_drops_deferred_to_a_failed_flush_are_reported_once(outbound_env, 
     send_json.side_effect = burst_then_503
     integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
 
-    await handlers.action_flush_buffers(integration=integration, action_config=FlushBuffersConfig())
+    await _sweep(integration)
 
     assert len(fake_redis.lists[key]) == 2
     errors = [c.kwargs for c in log_activity.call_args_list if c.kwargs["level"] == LogLevel.ERROR]
@@ -761,3 +706,93 @@ async def test_an_invalid_auth_config_does_not_break_the_bundle(outbound_env):
     send_json.assert_not_called()
     assert result["delivered"]["event"]["failed"] == 1
     assert log_activity.call_args.kwargs["data"]["error_type"] == "configuration"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_overflow_report_keeps_the_count_and_reopens_the_window(outbound_env, mocker):
+    _, log_activity = outbound_env
+    integration = make_integration()
+    integration_id = str(integration.id)
+    for n in range(4):
+        await handlers.outbound_buffer.push(integration_id, "observation", observation(n), max_records=2)
+    handlers.state_manager.set_if_absent = mocker.AsyncMock(return_value=True)
+    log_activity.side_effect = [ConnectionError("pubsub down"), None]
+
+    await handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION)
+
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 2
+    handlers.state_manager.delete_state.assert_awaited_once_with(
+        integration_id=integration_id, action_id="deliver", source_id="buffer-overflow-observation",
+    )
+
+    await handlers.outbound_buffer.push(integration_id, "observation", observation(9), max_records=2)
+    await handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION)
+
+    assert log_activity.call_args.kwargs["data"]["dropped"] == 3
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 0
+
+
+@pytest.mark.asyncio
+async def test_drops_counted_while_a_report_is_published_wait_for_the_next(outbound_env, mocker):
+    _, log_activity = outbound_env
+    integration = make_integration()
+    integration_id = str(integration.id)
+    for n in range(3):
+        await handlers.outbound_buffer.push(integration_id, "observation", observation(n), max_records=2)
+    handlers.state_manager.set_if_absent = mocker.AsyncMock(return_value=True)
+
+    async def publish_while_another_drop_lands(**kwargs):
+        await handlers.outbound_buffer.push(integration_id, "observation", observation(10), max_records=2)
+
+    log_activity.side_effect = publish_while_another_drop_lands
+
+    await handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION)
+
+    assert log_activity.call_args.kwargs["data"]["dropped"] == 1
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_sweep_does_not_fail_the_delivery(outbound_env, mocker):
+    send_json, _ = outbound_env
+    mocker.patch.object(handlers.outbound_buffer, "is_due", mocker.AsyncMock(side_effect=RedisError("down")))
+
+    result = await _deliver(event(1), observation_batch_mode=True)
+
+    assert result["delivered"] is True
+    assert "RedisError" in result["other_buffers"]["observation"]["error"]
+    assert send_json.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_also_sweeps_the_buffers(outbound_env, fake_redis):
+    send_json, _ = outbound_env
+    key = await _push_aged(fake_redis, [observation(0)], age_seconds=120)
+
+    result = await _deliver_batch(_bundle([event(0)]), observation_batch_mode=True)
+
+    assert result["buffers"]["observation"]["records_sent"] == 1
+    assert sorted(c.kwargs["url"] for c in send_json.call_args_list) == [
+        "https://hooks.example.com/events", "https://hooks.example.com/observations",
+    ]
+    assert fake_redis.lists[key] == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_respects_a_buffers_backoff(outbound_env, fake_redis):
+    send_json, _ = outbound_env
+    key = await _push_aged(fake_redis, [observation(0)], age_seconds=120)
+    await handlers.outbound_buffer.start_backoff(str(make_integration().id), "observation")
+    integration = make_integration(deliver=deliver_config_data(observation_batch_mode=True))
+
+    result = await _sweep(integration)
+
+    assert "backing_off_seconds" in result["other_buffers"]["observation"]
+    send_json.assert_not_called()
+    assert len(fake_redis.lists[key]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_integration_reports_no_sweep(outbound_env):
+    result = await _deliver(event(1), observation_batch_mode=True)
+    assert "other_buffers" not in result
