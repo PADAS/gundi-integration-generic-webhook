@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -821,3 +822,45 @@ async def test_a_failing_warning_publish_after_a_failed_flush_does_not_fail_the_
 
     assert result["buffered"] is True and "error" in result["flush"]
     assert len(_buffer_records(fake_redis)) == 1
+
+
+@pytest.mark.asyncio
+async def test_without_the_throttle_the_overflow_waits_unreported(outbound_env, mocker):
+    _, log_activity = outbound_env
+    integration = make_integration()
+    integration_id = str(integration.id)
+    for n in range(3):
+        await handlers.outbound_buffer.push(integration_id, "observation", observation(n), max_records=1)
+    handlers.state_manager.set_if_absent = mocker.AsyncMock(side_effect=RedisError("down"))
+
+    await handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION)
+
+    log_activity.assert_not_called()
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reporters_cannot_make_the_count_negative(outbound_env, mocker):
+    _, log_activity = outbound_env
+    integration = make_integration()
+    integration_id = str(integration.id)
+    for n in range(3):
+        await handlers.outbound_buffer.push(integration_id, "observation", observation(n), max_records=1)
+    # Both get a window (e.g. it expired between them), and both read the same count.
+    handlers.state_manager.set_if_absent = mocker.AsyncMock(return_value=True)
+
+    async def slow_publish(**kwargs):
+        await asyncio.sleep(0)
+
+    log_activity.side_effect = slow_publish
+
+    await asyncio.gather(*[
+        handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION) for _ in range(2)
+    ])
+
+    assert await handlers.outbound_buffer.pending_dropped(integration_id, "observation") == 0
+    await handlers.outbound_buffer.push(integration_id, "observation", observation(9), max_records=1)
+    await handlers._report_buffer_overflow(integration, "deliver", OutputType.OBSERVATION)
+    reported = [c.kwargs["data"]["dropped"] for c in log_activity.call_args_list]
+    assert all(count > 0 for count in reported)
+    assert reported[-1] == 1

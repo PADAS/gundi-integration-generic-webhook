@@ -137,6 +137,8 @@ class EndpointSettings(pydantic.BaseModel):
     max_wait_seconds: int
 
 
+MAX_BATCH_SIZE = 10000
+
 _OUTPUT_TYPE_ONE_OF = [{"const": t.value, "title": OUTPUT_TYPE_TITLES[t]} for t in OutputType]
 _URL_PATTERN = "^https://"
 
@@ -167,8 +169,11 @@ class Endpoint(pydantic.BaseModel):
     batch_mode: bool = pydantic.Field(
         False, title="Batch Mode", description="Send records in groups instead of one request per record.",
     )
+    # The buffer's default cap (OUTBOUND_BUFFER_MAX_RECORDS) is 10000, so a
+    # larger batch could never fill. It also bounds one request's size.
     max_batch_size: int = pydantic.Field(
-        100, ge=1, title="Max Batch Size", description="Batch mode: most records in one request.",
+        100, ge=1, le=MAX_BATCH_SIZE, title="Max Batch Size",
+        description=f"Batch mode: most records in one request (1 to {MAX_BATCH_SIZE}).",
     )
     max_wait_seconds: int = pydantic.Field(
         60, ge=60, title="Max Wait (seconds)",

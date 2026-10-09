@@ -37,6 +37,13 @@ def test_headers_digest_ignores_name_case_and_order_but_not_values():
     assert b"secret" not in headers_digest({"Authorization": "secret"})
 
 
+@pytest.mark.parametrize("chunk_size", [2 ** 32 - 1, 2 ** 32, 2 ** 64, 10 ** 30])
+def test_fingerprint_takes_any_chunk_size(chunk_size):
+    # A fixed-width field would overflow here and fail every delivery of the bundle.
+    assert len(fingerprint(["a"], chunk_size)) == batch_progress.FINGERPRINT_BYTES
+    assert fingerprint(["a"], chunk_size) != fingerprint(["a"], chunk_size + 1)
+
+
 def test_encode_decode_round_trip():
     fp = fingerprint(["a"] * 12, 1)
     raw = encode(fp, {0, 3, 11}, 12)

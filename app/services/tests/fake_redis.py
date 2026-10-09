@@ -86,6 +86,12 @@ class FakeRedis:
                 await self.incrby(dropped, excess)
                 return [length - excess, excess]
             return [length, 0]
+        if script == outbound_buffer._ACKNOWLEDGE_DROPPED:
+            amount = min(int(args[0]), int(self.values.get(keys[0], b"0")))
+            if amount > 0:
+                await self.decrby(keys[0], amount)
+                return amount
+            return 0
         holds_lock = self.values.get(keys[0]) == _bytes(args[0])
         if script == outbound_buffer._TRIM_IF_LOCKED:
             if not holds_lock:

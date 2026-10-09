@@ -299,3 +299,14 @@ async def test_a_head_without_a_usable_enqueue_time_is_due_now(buffer, redis, he
 async def test_a_numeric_string_enqueue_time_is_read_as_a_number(buffer, redis):
     redis.lists[KEY] = [json.dumps({"enqueued_at": str(time.time()), "record": {}}).encode()]
     assert not await buffer.is_due("integration-1", "observation", max_batch_size=10, max_wait_seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_acknowledging_never_drives_the_count_below_zero(buffer, redis):
+    for n in range(3):
+        await buffer.push("integration-1", "observation", {"n": n}, max_records=1)  # 2 dropped
+
+    assert await buffer.acknowledge_dropped("integration-1", "observation", 2) == 2
+    assert await buffer.acknowledge_dropped("integration-1", "observation", 2) == 0  # stale duplicate
+    assert await buffer.pending_dropped("integration-1", "observation") == 0
+    assert redis.values[DROPPED_KEY] == b"0"

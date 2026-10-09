@@ -33,11 +33,16 @@ def progress_key(batch_id, integration_id, output_type) -> str:
     return f"{KEY_PREFIX}.{batch_id}.{integration_id}.{output_type}"
 
 
+# 8 bytes holds the length of anything that fits in memory, so to_bytes
+# cannot overflow on a length.
+_LENGTH_BYTES = 8
+
+
 def _update_length_prefixed(h, fields: Sequence) -> None:
-    h.update(len(fields).to_bytes(4, "big"))
+    h.update(len(fields).to_bytes(_LENGTH_BYTES, "big"))
     for field in fields:
         raw = field if isinstance(field, bytes) else str(field).encode()
-        h.update(len(raw).to_bytes(4, "big"))
+        h.update(len(raw).to_bytes(_LENGTH_BYTES, "big"))
         h.update(raw)
 
 
@@ -54,7 +59,7 @@ def fingerprint(item_ids: Iterable, chunk_size: int, plan: Sequence = ()) -> byt
     """8-byte digest binding a record to an exact ordered id list, chunk size
     and request plan (any fields the caller's requests depend on).
 
-    Length-prefixed with fixed-width lengths rather than delimiter-joined:
+    Length-prefixed with fixed-width (8-byte) lengths rather than delimiter-joined:
     gundi_id may be any string, and a delimiter join lets two different lists
     collide (["a|b", "c"] vs ["a", "b|c"]). A collision would make decode()
     report requests as delivered that never were, the one outcome this must
@@ -62,7 +67,8 @@ def fingerprint(item_ids: Iterable, chunk_size: int, plan: Sequence = ()) -> byt
     because a record is only compared against plans for its own key.
     """
     h = hashlib.sha256()
-    h.update(int(chunk_size).to_bytes(4, "big"))
+    # As a decimal string, so no integer can overflow a fixed-width field.
+    _update_length_prefixed(h, [str(int(chunk_size))])
     _update_length_prefixed(h, [str(item_id) for item_id in item_ids])
     _update_length_prefixed(h, list(plan))
     return h.digest()[:FINGERPRINT_BYTES]

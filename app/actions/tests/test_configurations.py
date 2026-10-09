@@ -165,3 +165,14 @@ def test_auth_secrets_are_masked_in_portal_and_logs():
     assert redacted["api_key"] == REDACTED
     assert redacted["custom_headers"][0] == {"name": "X-Tenant", "value": REDACTED}
     assert "s3cret" not in repr(config) and "acme" not in repr(config)
+
+
+def test_max_batch_size_is_bounded_in_the_model_and_the_schema():
+    def endpoint(size):
+        return {"endpoints": [{"output_type": "event", "url": "https://x.example.com", "max_batch_size": size}]}
+
+    assert DeliverConfig.parse_obj(endpoint(10000)).endpoint_for(OutputType.EVENT).max_batch_size == 10000
+    with pytest.raises(pydantic.ValidationError):
+        DeliverConfig.parse_obj(endpoint(10001))
+    size_schema = json.loads(DeliverConfig.schema_json())["definitions"]["Endpoint"]["properties"]["max_batch_size"]
+    assert (size_schema["minimum"], size_schema["maximum"]) == (1, 10000)

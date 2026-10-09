@@ -309,7 +309,8 @@ async def _report_buffer_overflow(integration: Integration, action_id: str, outp
 
     The count is acknowledged only after the ERROR is published, and only the
     count it names, so drops are never lost to a failed publish and drops that
-    land meanwhile go into the next report. Never raises.
+    land meanwhile go into the next report. Without the throttle window there
+    is no report. Never raises.
     """
     integration_id = str(integration.id)
     window = dict(
@@ -317,15 +318,12 @@ async def _report_buffer_overflow(integration: Integration, action_id: str, outp
     )
     try:
         count = await outbound_buffer.pending_dropped(integration_id, output_type.value)
-        if not count:
+        if count <= 0:
             return
-        try:
-            first_in_window = await state_manager.set_if_absent(
-                **window, ttl_seconds=settings.OUTBOUND_OVERFLOW_REPORT_SECONDS,
-            )
-        except Exception:
-            first_in_window = True  # surface it rather than hide it when the throttle is unavailable
-        if not first_in_window:
+        # The window is also what keeps concurrent deliveries from reporting
+        # the same count. If it cannot be taken, the count waits for a later
+        # delivery, so this raises into the except below rather than report.
+        if not await state_manager.set_if_absent(**window, ttl_seconds=settings.OUTBOUND_OVERFLOW_REPORT_SECONDS):
             return
         try:
             await log_action_activity(

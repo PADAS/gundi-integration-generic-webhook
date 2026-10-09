@@ -41,6 +41,19 @@ end
 return {length, 0}
 """
 
+# Subtract a reported count, never below zero: a stale or duplicate
+# acknowledgement must not make later reports negative.
+# KEYS: dropped counter. ARGV: count. Returns the amount subtracted.
+_ACKNOWLEDGE_DROPPED = """
+local current = tonumber(redis.call('get', KEYS[1])) or 0
+local amount = math.min(tonumber(ARGV[1]), current)
+if amount > 0 then
+    redis.call('decrby', KEYS[1], amount)
+    return amount
+end
+return 0
+"""
+
 # Release the lock if this flusher still holds it, first applying any cap that
 # pushes deferred while it was held. KEYS: lock, buffer, dropped counter.
 # ARGV: token, cap. Returns the number of records dropped.
@@ -177,12 +190,15 @@ class OutboundBuffer:
 
     async def pending_dropped(self, integration_id, output_type) -> int:
         """Records dropped by the cap and not yet taken."""
-        return int(await self.db_client.get(_dropped_key(integration_id, output_type)) or 0)
+        return max(0, int(await self.db_client.get(_dropped_key(integration_id, output_type)) or 0))
 
-    async def acknowledge_dropped(self, integration_id, output_type, count: int):
-        """Mark `count` dropped records as reported. Subtracts rather than
-        deletes, so drops counted since they were read stay for the next report."""
-        await self.db_client.decrby(_dropped_key(integration_id, output_type), count)
+    async def acknowledge_dropped(self, integration_id, output_type, count: int) -> int:
+        """Mark `count` dropped records as reported; returns the amount subtracted.
+        Subtracts rather than deletes, so drops counted since they were read stay
+        for the next report, and never goes below zero."""
+        return int(await self.db_client.eval(
+            _ACKNOWLEDGE_DROPPED, 1, _dropped_key(integration_id, output_type), count,
+        ))
 
     async def length(self, integration_id, output_type) -> int:
         return await self.db_client.llen(buffer_key(integration_id, output_type))
