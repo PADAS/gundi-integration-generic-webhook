@@ -56,6 +56,15 @@ BLOCKED_NETWORKS = [
 ]
 
 
+class URLResolutionError(ValueError):
+    """The hostname could not be resolved (timeout, resolver failure).
+
+    A ValueError like every other refusal here, so existing callers are
+    unaffected; callers that retry can tell a transient DNS failure from a
+    URL the policy rejects.
+    """
+
+
 async def _resolve_addresses(hostname: str) -> list:
     """Every address `hostname` resolves to, as strings, within
     DNS_RESOLUTION_TIMEOUT_SECONDS. Tests replace this function rather than
@@ -96,11 +105,11 @@ async def validate_outbound_url(url: str, *, allowlist: Iterable[str] = (), what
     try:
         addresses = await _resolve_addresses(hostname)
     except asyncio.TimeoutError:
-        raise ValueError(
+        raise URLResolutionError(
             f"Timed out resolving {what} hostname '{hostname}' after {DNS_RESOLUTION_TIMEOUT_SECONDS:g}s."
         )
     except OSError as e:
-        raise ValueError(f"Cannot resolve {what} hostname '{hostname}': {e}")
+        raise URLResolutionError(f"Cannot resolve {what} hostname '{hostname}': {e}")
     for address in addresses:
         ip = ipaddress.ip_address(address)
         # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) parses as IPv6 and would

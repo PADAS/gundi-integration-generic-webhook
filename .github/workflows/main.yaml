@@ -4,6 +4,11 @@ on:
     branches:
       - main
       - 'release-**'
+      # Hackathon: build (only) images of the outbound-webhooks branch for the
+      # separate hackathon-generic-webhooks dev deployment. The deploy_* jobs
+      # are gated on main/release, so this never touches existing deployments.
+      # Remove before merging.
+      - hackathon-outbound-webhooks
 
 jobs:
   vars:

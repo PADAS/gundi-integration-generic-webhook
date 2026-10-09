@@ -745,7 +745,7 @@ async def test_handler_routes_all_records_via_config_output_type(
 
     mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     records = [{"source": "device-1"}, {"source": "device-2"}]
-    mocker.patch("app.webhooks.handlers.pyjq.all", return_value=records)
+    mocker.patch("app.webhooks.handlers.jq_all", return_value=records)
     mock_send = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
     mock_send.return_value = records
 
@@ -768,7 +768,7 @@ async def test_handler_routes_per_record_output_type(
     obv1 = {"__gundi_output_type": "obv", "source": "device-1"}
     obv2 = {"__gundi_output_type": "obv", "source": "device-2"}
     ev1 = {"__gundi_output_type": "ev", "title": "Alert"}
-    mocker.patch("app.webhooks.handlers.pyjq.all", return_value=[obv1, obv2, ev1])
+    mocker.patch("app.webhooks.handlers.jq_all", return_value=[obv1, obv2, ev1])
     mock_send_obv = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
     mock_send_obv.return_value = [obv1, obv2]
     mock_send_ev = mocker.patch("app.webhooks.handlers.send_events_to_gundi", new_callable=AsyncMock)
@@ -792,7 +792,7 @@ async def test_handler_strips_gundi_output_type_before_sending(
 
     mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     record = {"__gundi_output_type": "obv", "source": "device-1"}
-    mocker.patch("app.webhooks.handlers.pyjq.all", return_value=[record])
+    mocker.patch("app.webhooks.handlers.jq_all", return_value=[record])
     mock_send = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
     mock_send.return_value = [{"source": "device-1"}]
 
@@ -815,7 +815,7 @@ async def test_handler_per_record_type_overrides_config(
     mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     # Config says "obv" but this record overrides to "ev"
     record = {"__gundi_output_type": "ev", "title": "Alert"}
-    mocker.patch("app.webhooks.handlers.pyjq.all", return_value=[record])
+    mocker.patch("app.webhooks.handlers.jq_all", return_value=[record])
     mock_send_obv = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
     mock_send_ev = mocker.patch("app.webhooks.handlers.send_events_to_gundi", new_callable=AsyncMock)
     mock_send_ev.return_value = [record]
@@ -838,7 +838,7 @@ async def test_handler_raises_when_no_output_type_resolved(
     mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
     config_no_type = GenericJsonTransformConfig(output_type=None, jq_filter=".", json_schema={})
     record = {"source": "device-1"}  # no __gundi_output_type, no config default
-    mocker.patch("app.webhooks.handlers.pyjq.all", return_value=[record])
+    mocker.patch("app.webhooks.handlers.jq_all", return_value=[record])
 
     payload = MagicMock(spec=GenericJsonPayload)
     payload.json.return_value = "{}"
@@ -860,3 +860,49 @@ def test_fork_webhook_config_documents_per_record_output_type_override():
     assert issubclass(GenericWebhookTransformConfig, GenericJsonTransformConfig)
     description = GenericWebhookTransformConfig.schema()["properties"]["output_type"]["description"]
     assert "__gundi_output_type" in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("jq_filter", [
+    'if .kind == "alert" then {title: .name, __gundi_output_type: "ev"}\nelse {source: .name}\nend',
+    'if .kind == "alert" then {title: .name, __gundi_output_type: "ev"}\r\nelse {source: .name}\r\nend',
+    'select(.kind == "alert"\nor .kind == "fix")\n| if .kind == "alert" then {title: .name, __gundi_output_type: "ev"} # alerts\n  else {source: .name} end',
+])
+async def test_handler_runs_multi_line_jq_filters(mocker, mock_integration_for_handler, jq_filter):
+    from app.webhooks import GenericJsonTransformConfig
+    from app.webhooks.handlers import webhook_handler
+
+    mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
+    mock_send_obv = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
+    mock_send_obv.return_value = [{}]
+    mock_send_ev = mocker.patch("app.webhooks.handlers.send_events_to_gundi", new_callable=AsyncMock)
+    mock_send_ev.return_value = [{}]
+    payload = MagicMock()
+    payload.json.return_value = '{"kind": "alert", "name": "Gate"}'
+    config = GenericJsonTransformConfig(output_type="obv", jq_filter=jq_filter, json_schema={})
+
+    result = await webhook_handler(payload=payload, integration=mock_integration_for_handler, webhook_config=config)
+
+    assert result == {"data_points_qty": 1}
+    assert mock_send_ev.call_args.kwargs["events"] == [{"title": "Gate"}]
+    assert not mock_send_obv.called
+
+
+@pytest.mark.asyncio
+async def test_handler_output_of_a_filter_that_worked_before_is_unchanged(mocker, mock_integration_for_handler):
+    from app.webhooks import GenericJsonTransformConfig
+    from app.webhooks.handlers import webhook_handler
+
+    mocker.patch("app.services.activity_logger.publish_event", new_callable=AsyncMock)
+    mock_send_obv = mocker.patch("app.webhooks.handlers.send_observations_to_gundi", new_callable=AsyncMock)
+    mock_send_obv.return_value = [{}]
+    payload = MagicMock()
+    payload.json.return_value = '{"device": {"id": "d-1"}, "lat": -1.5, "lon": 36.8}'
+    config = GenericJsonTransformConfig(
+        output_type="obv", json_schema={},
+        jq_filter='{\n  "source": .device.id,\n  "location": {"lat": .lat,\n "lon": .lon}\n}',
+    )
+
+    await webhook_handler(payload=payload, integration=mock_integration_for_handler, webhook_config=config)
+
+    assert mock_send_obv.call_args.kwargs["observations"] == [{"source": "d-1", "location": {"lat": -1.5, "lon": 36.8}}]
