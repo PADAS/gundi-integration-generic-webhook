@@ -167,15 +167,17 @@ _URL_PATTERN = "^https://"
 
 class Endpoint(pydantic.BaseModel):
     output_type: OutputType = pydantic.Field(..., title="Data Type")
-    # Secret because webhook URLs are often credentials (Slack-style hook paths,
-    # ?token=...); this keeps them out of activity-log config data. The pattern
-    # lets the portal and cdip refuse a non-https URL on save.
+    # SecretStr because webhook URLs are often credentials (Slack-style hook
+    # paths, ?token=...): it keeps them out of activity-log config data and
+    # error events. The portal still shows it as plain text (see Config below)
+    # so users can read back what they saved. The pattern lets the portal and
+    # cdip refuse a non-https URL on save.
     url: pydantic.SecretStr = FieldWithUIOptions(
         ...,
         title="URL",
         description="HTTPS endpoint that receives this data type.",
         pattern=_URL_PATTERN,
-        ui_options=UIOptions(widget="password", placeholder="https://example.com/webhooks/gundi"),
+        ui_options=UIOptions(widget="text", placeholder="https://example.com/webhooks/gundi"),
     )
     method: HttpMethod = pydantic.Field(HttpMethod.POST, title="HTTP Method")
     # Its ui schema is set in DeliverConfig.ui_schema.
@@ -219,6 +221,14 @@ class Endpoint(pydantic.BaseModel):
 
     def settings(self) -> EndpointSettings:
         return EndpointSettings(**{**self.dict(), "url": self.url.get_secret_value()})
+
+    class Config:
+        @staticmethod
+        def schema_extra(schema, model):
+            # SecretStr emits format=password/writeOnly, which makes forms mask
+            # the URL; it's shown as text, and redaction keys off the type.
+            schema["properties"]["url"].pop("format", None)
+            schema["properties"]["url"].pop("writeOnly", None)
 
 
 class DeliverConfig(PushActionConfiguration):

@@ -63,9 +63,11 @@ none: the portal calls it whenever the editor opens or refreshes.
   - `output_type`: Observations, Events, Event Updates or Messages (stored as
     `observation`, `event`, `event_update`, `message`). **Only one endpoint per
     data type**: a duplicate is rejected on save.
-  - `url` (required, secret, password widget): webhook URLs are often
-    credentials (Slack-style hook paths, `?token=`), so they never appear in
-    activity-log config data.
+  - `url` (required, shown as plain text): webhook URLs are often
+    credentials (Slack-style hook paths, `?token=`). The model types it as
+    `SecretStr`, so it never appears in activity-log config data or error
+    events, but the portal renders it as a text input so users can read back
+    what they saved.
     - The JSON schema has `pattern: "^https://"`, so the portal and cdip refuse
       a non-https URL on save, and the model applies the same rule.
     - At send time the URL must also resolve to public addresses only
@@ -431,10 +433,6 @@ the redelivered bundle resumes at the failed request. Records expire after
 - **The buffer's Lua scripts are not exercised against a real Redis.** The
   tests emulate them in `app/services/tests/fake_redis.py`. Add a
   `fakeredis[lua]` or real-Redis test before production.
-- **URLs behind a password widget**: keeping endpoint URLs secret means users
-  cannot read back the URL they saved, and browsers may offer password
-  autofill on those fields. A host-only preview would help; check it in the
-  portal.
 - **Failure wording**: delivery failures go through the template's
   `format_error_message`, which reads "Unexpected response from the provider"
   even though the failing side here is the destination endpoint. A

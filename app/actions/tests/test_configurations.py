@@ -62,7 +62,8 @@ def test_endpoint_urls_must_be_https(url):
 def test_the_https_rule_is_in_the_schema_so_the_portal_and_cdip_refuse_it_on_save():
     url_schema = json.loads(DeliverConfig.schema_json())["definitions"]["Endpoint"]["properties"]["url"]
     assert url_schema["pattern"] == "^https://"
-    assert url_schema["format"] == "password"
+    # Shown as plain text in the portal; still a SecretStr for redaction.
+    assert "format" not in url_schema and "writeOnly" not in url_schema
     for url, accepted in [("https://x.example.com/h", True), ("http://x.example.com/h", False)]:
         assert bool(re.match(url_schema["pattern"], url)) is accepted
         try:
@@ -102,7 +103,7 @@ def test_deliver_ui_schema_renders_endpoint_items():
     # jsonb storage reorders keys, so the item order must be explicit and complete.
     assert sorted(items["ui:order"]) == sorted(endpoint_schema["properties"])
     assert items["ui:order"][:2] == ["output_type", "url"]
-    assert items["url"] == {"ui:widget": "password", "ui:placeholder": "https://example.com/webhooks/gundi"}
+    assert items["url"] == {"ui:widget": "text", "ui:placeholder": "https://example.com/webhooks/gundi"}
     assert items["ui:order"][-1] == "capture_samples"
     jq_filter = dict(items["jq_filter"])
     annotation = jq_filter.pop("gundi:jq_transform")
