@@ -1,9 +1,17 @@
 """JQ filters shared by the inbound webhook handler and the outbound deliver actions."""
+import json
 from typing import Any, List, Tuple
 
+import pydantic
 import pyjq
 
 from .errors import IntegrationConfigurationError
+
+
+def jq_input(payload: pydantic.BaseModel) -> dict:
+    """A Gundi payload as an outbound jq filter receives it."""
+    # Through .json() so datetimes and UUIDs become JSON values jq can read.
+    return json.loads(payload.json())
 
 
 def jq_all(filter_expression: str, input_data: Any) -> List[Any]:

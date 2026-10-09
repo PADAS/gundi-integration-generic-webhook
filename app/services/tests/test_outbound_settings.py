@@ -12,7 +12,12 @@ VALID = {
     "OUTBOUND_BACKOFF_INITIAL_SECONDS": 30,
     "OUTBOUND_BACKOFF_MAX_SECONDS": 900,
     "OUTBOUND_OVERFLOW_REPORT_SECONDS": 600,
+    "OUTBOUND_SAMPLES_MAX": 3,
+    "OUTBOUND_SAMPLES_TTL_SECONDS": 172800,
+    "OUTBOUND_SAMPLE_MAX_BYTES": 65536,
+    "OUTBOUND_SAMPLES_TIMEOUT_SECONDS": 1.0,
 }
+_POSITIVE_NUMBERS = ("OUTBOUND_REQUEST_TIMEOUT_SECONDS", "OUTBOUND_SAMPLES_TIMEOUT_SECONDS")
 
 
 def test_the_defaults_are_valid():
@@ -20,17 +25,18 @@ def test_the_defaults_are_valid():
     integration.validate_outbound_settings(vars(integration))
 
 
-@pytest.mark.parametrize("name", [n for n in VALID if n != "OUTBOUND_REQUEST_TIMEOUT_SECONDS"])
+@pytest.mark.parametrize("name", [n for n in VALID if n not in _POSITIVE_NUMBERS])
 @pytest.mark.parametrize("bad", [0, -5, True, 1.5])
 def test_counts_and_durations_must_be_positive_integers(name, bad):
     with pytest.raises(ValueError, match=rf"^{name} must be a positive integer; got {bad!r}\."):
         integration.validate_outbound_settings({**VALID, name: bad})
 
 
+@pytest.mark.parametrize("name", _POSITIVE_NUMBERS)
 @pytest.mark.parametrize("bad", [0, -1.0, True])
-def test_the_request_timeout_must_be_positive(bad):
-    with pytest.raises(ValueError, match=rf"^OUTBOUND_REQUEST_TIMEOUT_SECONDS must be a positive number; got {bad!r}\."):
-        integration.validate_outbound_settings({**VALID, "OUTBOUND_REQUEST_TIMEOUT_SECONDS": bad})
+def test_timeouts_must_be_positive(name, bad):
+    with pytest.raises(ValueError, match=rf"^{name} must be a positive number; got {bad!r}\."):
+        integration.validate_outbound_settings({**VALID, name: bad})
 
 
 def test_the_initial_backoff_must_not_exceed_the_max():

@@ -37,7 +37,10 @@ class FakeRedis:
         return True
 
     async def delete(self, *names):
-        return sum(1 for name in names if self.values.pop(name, None) is not None)
+        return sum(
+            1 for name in names
+            if self.values.pop(name, None) is not None or self.lists.pop(name, None) is not None
+        )
 
     async def incrby(self, name, amount):
         value = int(self.values.get(name, b"0")) + amount
@@ -52,7 +55,13 @@ class FakeRedis:
 
     async def expire(self, name, time):
         self.ttls[name] = time
-        return name in self.values
+        return name in self.values or name in self.lists
+
+    async def lpush(self, name, *values):
+        items = self.lists.setdefault(name, [])
+        for value in values:
+            items.insert(0, _bytes(value))
+        return len(items)
 
     async def rpush(self, name, *values):
         items = self.lists.setdefault(name, [])
@@ -74,6 +83,9 @@ class FakeRedis:
         items = self.lists.get(name, [])
         self.lists[name] = items[start:] if end == -1 else items[start:end + 1]
         return True
+
+    def pipeline(self, transaction=True):
+        return FakePipeline(self)
 
     async def eval(self, script, numkeys, *keys_and_args):
         keys, args = keys_and_args[:numkeys], keys_and_args[numkeys:]
@@ -108,3 +120,30 @@ class FakeRedis:
             await self.delete(keys[0])
             return max(excess, 0)
         raise NotImplementedError("FakeRedis does not emulate this script")
+
+
+class FakePipeline:
+    """Queues commands and runs them in order on execute(), like a MULTI/EXEC pipeline."""
+
+    def __init__(self, redis):
+        self.redis = redis
+        self.commands = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self.commands = []
+
+    def __getattr__(self, name):
+        method = getattr(self.redis, name)
+
+        def queue(*args, **kwargs):
+            self.commands.append((method, args, kwargs))
+            return self
+        return queue
+
+    async def execute(self):
+        results = [await method(*args, **kwargs) for method, args, kwargs in self.commands]
+        self.commands = []
+        return results

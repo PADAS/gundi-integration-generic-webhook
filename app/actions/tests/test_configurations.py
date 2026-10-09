@@ -4,9 +4,13 @@ import re
 import pydantic
 import pytest
 
-from app.actions.configurations import AuthenticateConfig, DeliverConfig, HttpMethod, OutputType
+from app import settings
+from app.actions import configurations
+from app.actions.configurations import AuthenticateConfig, DeliverConfig, Endpoint, HttpMethod, OutputType
+from app.actions.jq_editor import MODELS
 from app.actions.core import ExecutableActionMixin
 from app.actions.tests.conftest import deliver_config_data
+from app.services.jq_transform import jq_input
 from app.services.redaction import REDACTED, redact_secrets
 
 
@@ -99,7 +103,75 @@ def test_deliver_ui_schema_renders_endpoint_items():
     assert sorted(items["ui:order"]) == sorted(endpoint_schema["properties"])
     assert items["ui:order"][:2] == ["output_type", "url"]
     assert items["url"] == {"ui:widget": "password", "ui:placeholder": "https://example.com/webhooks/gundi"}
-    assert items["jq_filter"] == {"ui:widget": "textarea", "ui:options": {"language": "jq"}, "ui:rows": 4}
+    assert items["ui:order"][-1] == "capture_samples"
+    jq_filter = dict(items["jq_filter"])
+    annotation = jq_filter.pop("gundi:jq_transform")
+    assert jq_filter == {"ui:widget": "textarea", "ui:options": {"language": "jq", "rows": 4}}
+    assert {k: annotation[k] for k in ("output_type_field", "batch_field", "samples_action")} == {
+        "output_type_field": "output_type", "batch_field": "batch_mode", "samples_action": "get_data_samples",
+    }
+    assert annotation["output_type_field"] in endpoint_schema["properties"]
+    assert annotation["batch_field"] in endpoint_schema["properties"]
+
+
+def _jq_annotation():
+    return DeliverConfig.ui_schema()["endpoints"]["items"]["jq_filter"]["gundi:jq_transform"]
+
+
+def test_jq_annotation_covers_every_output_type_with_gundi_core_schemas():
+    annotation = _jq_annotation()
+    types = {t.value for t in OutputType}
+    assert set(MODELS) == set(annotation["schemas"]) == set(annotation["examples"]) == types
+    for name, model in MODELS.items():
+        assert annotation["schemas"][name] == model.schema()
+
+
+@pytest.mark.parametrize("output_type", [t.value for t in OutputType])
+def test_jq_examples_are_shaped_like_the_jq_input(output_type):
+    example = _jq_annotation()["examples"][output_type]
+    parsed = MODELS[output_type].parse_obj(example)
+    assert jq_input(parsed) == example
+    assert example["gundi_id"] and example["data_provider_id"]
+
+
+def test_jq_examples_carry_extra_data_keys():
+    examples = _jq_annotation()["examples"]
+    assert len(examples["observation"]["additional"]) >= 2
+    assert len(examples["event"]["event_details"]) >= 2
+    assert len(examples["message"]["additional"]) >= 2
+    assert examples["event_update"]["changes"]
+
+
+def test_deliver_ui_schema_stays_small():
+    # Stored per integration type and sent to the portal with every config form.
+    assert len(json.dumps(DeliverConfig.ui_schema())) < 40 * 1024
+
+
+def test_sample_capture_is_off_by_default_and_explains_itself():
+    endpoint = Endpoint(output_type="event", url="https://x.example.com")
+    assert endpoint.capture_samples is False
+    assert endpoint.settings().capture_samples is False
+    field = json.loads(DeliverConfig.schema_json())["definitions"]["Endpoint"]["properties"]["capture_samples"]
+    assert field["title"] == "Capture data samples"
+    assert field["description"] == (
+        "While on, the latest 3 records of this data type, as the JQ filter receives them, are kept for "
+        "2 days for use in the transformation editor. They are real data. Turning this off hides them at "
+        "once; they are deleted when the next record of this type arrives, or within 2 days."
+    )
+
+
+def test_the_capture_description_follows_the_settings(mocker):
+    mocker.patch.object(settings, "OUTBOUND_SAMPLES_MAX", 5)
+    mocker.patch.object(settings, "OUTBOUND_SAMPLES_TTL_SECONDS", 36 * 3600)
+    description = configurations._capture_samples_description()
+    assert "the latest 5 records" in description and description.count("36 hours") == 2
+
+
+@pytest.mark.parametrize("seconds, text", [
+    (172800, "2 days"), (86400, "1 day"), (129600, "36 hours"), (5400, "90 minutes"), (61, "61 seconds"),
+])
+def test_duration_text(seconds, text):
+    assert configurations.duration_text(seconds) == text
 
 
 def test_data_type_options_have_readable_labels():

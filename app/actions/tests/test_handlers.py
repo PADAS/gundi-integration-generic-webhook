@@ -7,14 +7,17 @@ from gundi_core.events import GundiDelivery, LogLevel
 from redis.exceptions import RedisError
 
 from app.actions import client, handlers
-from app.actions.configurations import AuthenticateConfig, DeliverBatchConfig, DeliverConfig, OutputType
+from app.actions.configurations import (
+    AuthenticateConfig, DeliverBatchConfig, DeliverConfig, GetDataSamplesQuery, OutputType,
+)
 from app.actions.envelopes import GundiBatchDelivery
 from app.actions.tests.conftest import (
-    AUTH_CONFIG_DATA, PROVIDER, attachment, deliver_config_data, event, make_integration, observation, text_message,
+    AUTH_CONFIG_DATA, INTEGRATION_ID, PROVIDER, attachment, deliver_config_data, event, make_integration, observation, text_message,
 )
 from app import settings
 from app.services.errors import IntegrationBadResponseError, IntegrationConfigurationError, IntegrationConnectionError
 from app.services.outbound_buffer import buffer_key
+from app.services.outbound_samples import samples_key
 
 
 # Fails to parse: the portal cannot save it, but a hand-edited row could hold it.
@@ -864,3 +867,221 @@ async def test_concurrent_reporters_cannot_make_the_count_negative(outbound_env,
     reported = [c.kwargs["data"]["dropped"] for c in log_activity.call_args_list]
     assert all(count > 0 for count in reported)
     assert reported[-1] == 1
+
+
+# Sample capture for the transformation editor
+
+def _samples(fake_redis, output_type):
+    return [json.loads(e)["record"] for e in fake_redis.lists.get(samples_key(INTEGRATION_ID, output_type), [])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_mode", [False, True])
+async def test_deliver_captures_the_jq_input_when_enabled(outbound_env, fake_redis, batch_mode):
+    await _deliver(event(1), event_capture_samples=True, event_batch_mode=batch_mode, event_jq_filter="{t: .title}")
+
+    [sample] = _samples(fake_redis, "event")
+    # The record before the filter, as the filter receives it.
+    assert sample["title"] == "Sighting 1" and sample["observation_type"] == "ev"
+    assert _samples(fake_redis, "observation") == []
+
+
+@pytest.mark.asyncio
+async def test_deliver_captures_before_sending(outbound_env, fake_redis):
+    send_json, _ = outbound_env
+    send_json.side_effect = client.EndpointServerError("POST answered HTTP 503", 503)
+
+    with pytest.raises(IntegrationBadResponseError):
+        await _deliver(event(1), event_capture_samples=True)
+
+    assert len(_samples(fake_redis, "event")) == 1
+
+
+@pytest.mark.asyncio
+async def test_turning_capture_off_deletes_the_samples_at_the_next_delivery(outbound_env, fake_redis):
+    await _deliver(event(1), event_capture_samples=True)
+    await _deliver(event(2))
+
+    assert _samples(fake_redis, "event") == []
+
+
+@pytest.mark.asyncio
+async def test_types_without_an_endpoint_are_not_captured(outbound_env, fake_redis):
+    await _deliver(text_message(1), event_capture_samples=True)
+    assert not any(key.startswith("outbound_samples.") for key in fake_redis.lists)
+
+
+@pytest.mark.asyncio
+async def test_a_capture_failure_does_not_fail_the_delivery(outbound_env, mocker):
+    send_json, _ = outbound_env
+    mocker.patch.object(handlers.outbound_samples, "capture", mocker.AsyncMock(side_effect=RedisError("down")))
+    mocker.patch.object(handlers.outbound_samples, "clear", mocker.AsyncMock(side_effect=RedisError("down")))
+
+    assert (await _deliver(event(1), event_capture_samples=True))["delivered"] is True
+    assert (await _deliver(observation(1)))["delivered"] is True
+    assert send_json.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_captures_its_newest_records_per_type(outbound_env, fake_redis):
+    await _deliver_batch(
+        _bundle([event(n) for n in range(5)] + [observation(n) for n in range(2)]),
+        event_capture_samples=True, event_batch_mode=True,
+    )
+
+    assert [s["title"] for s in _samples(fake_redis, "event")] == ["Sighting 4", "Sighting 3", "Sighting 2"]
+    assert _samples(fake_redis, "observation") == []
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_clears_the_samples_of_types_with_capture_off(outbound_env, fake_redis):
+    await _deliver(event(1), event_capture_samples=True)
+    await _deliver_batch(_bundle([event(2)]))
+
+    assert _samples(fake_redis, "event") == []
+
+
+async def _get_samples(deliver=None, **query):
+    return await handlers.action_get_data_samples(
+        integration=make_integration(deliver=deliver), action_config=GetDataSamplesQuery.parse_obj(query),
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_data_samples_returns_every_type_newest_first(outbound_env):
+    config = deliver_config_data(output_types=["observation", "event", "message"], event_capture_samples=True)
+    for n in range(4):
+        await _deliver(event(n), event_capture_samples=True)
+
+    result = await _get_samples(config)
+
+    assert set(result) == {"samples", "capture_enabled", "max_samples", "ttl_seconds"}
+    assert [s["record"]["title"] for s in result["samples"]["event"]] == ["Sighting 3", "Sighting 2", "Sighting 1"]
+    assert all(set(s) == {"captured_at", "record"} for s in result["samples"]["event"])
+    assert {k: v for k, v in result["samples"].items() if k != "event"} == {
+        "observation": [], "event_update": [], "message": [],
+    }
+    assert result["capture_enabled"] == {"observation": False, "event": True, "event_update": False, "message": False}
+    assert (result["max_samples"], result["ttl_seconds"]) == (3, 172800)
+
+
+@pytest.mark.asyncio
+async def test_get_data_samples_filters_by_type(outbound_env):
+    await _deliver(event(1), event_capture_samples=True)
+
+    result = await _get_samples(deliver_config_data(event_capture_samples=True), output_type="observation")
+
+    assert result["samples"] == {"observation": []}
+    assert result["capture_enabled"]["event"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deliver", [None, {}, DUPLICATE_ENDPOINTS])
+async def test_get_data_samples_without_a_usable_deliver_config(outbound_env, deliver):
+    result = await _get_samples(deliver)
+
+    assert result["samples"] == {"observation": [], "event": [], "event_update": [], "message": []}
+    assert not any(result["capture_enabled"].values())
+
+
+@pytest.mark.asyncio
+async def test_get_data_samples_publishes_no_activity_events(outbound_env, published_events):
+    _, log_activity = outbound_env
+    await _get_samples(deliver_config_data())
+    assert not published_events.called and not log_activity.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_now", [
+    deliver_config_data(),  # capture switched off
+    deliver_config_data(output_types=["observation"]),  # endpoint removed
+])
+async def test_samples_are_hidden_and_deleted_once_capture_is_off(outbound_env, fake_redis, config_now):
+    await _deliver(event(1), event_capture_samples=True)
+
+    result = await _get_samples(config_now)
+
+    assert result["samples"]["event"] == []
+    assert result["capture_enabled"]["event"] is False
+    assert _samples(fake_redis, "event") == []
+
+
+@pytest.mark.asyncio
+async def test_get_data_samples_still_answers_when_the_clear_fails(outbound_env, mocker):
+    await _deliver(event(1), event_capture_samples=True)
+    mocker.patch.object(handlers.outbound_samples, "clear", mocker.AsyncMock(side_effect=RedisError("down")))
+
+    result = await _get_samples(deliver_config_data(event_capture_samples=True))
+
+    assert len(result["samples"]["event"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [True, False])
+async def test_a_stalled_redis_does_not_hold_the_delivery(outbound_env, mocker, capture):
+    send_json, _ = outbound_env
+    mocker.patch.object(settings, "OUTBOUND_SAMPLES_TIMEOUT_SECONDS", 0.01)
+
+    async def stall(*args, **kwargs):
+        await asyncio.sleep(10)
+    mocker.patch.object(handlers.outbound_samples, "capture", stall)
+    mocker.patch.object(handlers.outbound_samples, "clear", stall)
+
+    started = time.monotonic()
+    assert (await _deliver(event(1), event_capture_samples=capture))["delivered"] is True
+    assert time.monotonic() - started < 1
+    assert send_json.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_the_capture_off_delete_is_rate_limited(outbound_env, mocker):
+    clear = mocker.spy(handlers.outbound_samples, "clear")
+    monotonic = mocker.patch.object(handlers, "monotonic", return_value=1000.0)
+
+    await _deliver(event(1))
+    await _deliver(event(2))
+    monotonic.return_value = 1059.0
+    await _deliver(event(3))
+    assert clear.call_count == 1
+
+    monotonic.return_value = 1061.0
+    await _deliver(event(4))
+    assert clear.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_turning_capture_off_again_deletes_without_waiting_for_the_window(outbound_env, fake_redis, mocker):
+    mocker.patch.object(handlers, "monotonic", return_value=1000.0)
+    await _deliver(event(1))
+    await _deliver(event(2), event_capture_samples=True)
+    await _deliver(event(3))
+
+    assert _samples(fake_redis, "event") == []
+
+
+@pytest.mark.asyncio
+async def test_the_rate_limit_map_is_bounded(outbound_env, mocker):
+    mocker.patch.object(handlers, "_SAMPLES_CLEARED_MAX_ENTRIES", 2)
+    for output_type, payload in (("observation", observation(1)), ("event", event(1)), ("message", text_message(1))):
+        await _deliver(payload, output_types=[output_type])
+    assert len(handlers._samples_cleared_at) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_captured_sample_is_the_transformed_record(outbound_env, fake_redis):
+    route_configuration = {"name": "mappings", "data": {"field_mappings": {
+        PROVIDER["provider_id"]: {"ev": {INTEGRATION_ID: {
+            "provider_field": "event_type", "destination_field": "event_type",
+            "map": {"wildlife_sighting": "elephant_sighting_rep"},
+        }}},
+    }}}
+    data = deliver_config_data(event_capture_samples=True)
+    await handlers.action_deliver(
+        integration=make_integration(deliver=data, auth=AUTH_CONFIG_DATA),
+        action_config=DeliverConfig.parse_obj(data),
+        data=GundiDelivery(payload=event(1), provider=PROVIDER, route_configuration=route_configuration),
+        metadata={},
+    )
+
+    [sample] = _samples(fake_redis, "event")
+    assert sample["event_type"] == "elephant_sighting_rep"

@@ -21,6 +21,15 @@ OUTBOUND_BACKOFF_MAX_SECONDS = env.int("OUTBOUND_BACKOFF_MAX_SECONDS", 900)
 # A full buffer's drops are reported to the activity log at most this often.
 OUTBOUND_OVERFLOW_REPORT_SECONDS = env.int("OUTBOUND_OVERFLOW_REPORT_SECONDS", 600)
 
+# Endpoint.capture_samples keeps this many recent records per data type, for
+# this long, for the portal's transformation editor. A stored entry (record plus
+# capture time) over the byte limit is skipped.
+OUTBOUND_SAMPLES_MAX = env.int("OUTBOUND_SAMPLES_MAX", 3)
+OUTBOUND_SAMPLES_TTL_SECONDS = env.int("OUTBOUND_SAMPLES_TTL_SECONDS", 2 * 24 * 60 * 60)
+OUTBOUND_SAMPLE_MAX_BYTES = env.int("OUTBOUND_SAMPLE_MAX_BYTES", 65536)
+# Capture runs before the send, so a stalled Redis must not hold the delivery up.
+OUTBOUND_SAMPLES_TIMEOUT_SECONDS = env.float("OUTBOUND_SAMPLES_TIMEOUT_SECONDS", 1.0)
+
 _OUTBOUND_POSITIVE_INTS = (
     "OUTBOUND_FLUSH_LOCK_SECONDS",
     "OUTBOUND_BATCH_PROGRESS_TTL_SECONDS",
@@ -28,6 +37,9 @@ _OUTBOUND_POSITIVE_INTS = (
     "OUTBOUND_BACKOFF_INITIAL_SECONDS",
     "OUTBOUND_BACKOFF_MAX_SECONDS",
     "OUTBOUND_OVERFLOW_REPORT_SECONDS",
+    "OUTBOUND_SAMPLES_MAX",
+    "OUTBOUND_SAMPLES_TTL_SECONDS",
+    "OUTBOUND_SAMPLE_MAX_BYTES",
 )
 
 
@@ -41,9 +53,11 @@ def validate_outbound_settings(values: dict) -> None:
         value = values[name]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+    for name in ("OUTBOUND_REQUEST_TIMEOUT_SECONDS", "OUTBOUND_SAMPLES_TIMEOUT_SECONDS"):
+        value = values[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+            raise ValueError(f"{name} must be a positive number; got {value!r}.")
     timeout = values["OUTBOUND_REQUEST_TIMEOUT_SECONDS"]
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
-        raise ValueError(f"OUTBOUND_REQUEST_TIMEOUT_SECONDS must be a positive number; got {timeout!r}.")
     if values["OUTBOUND_BACKOFF_INITIAL_SECONDS"] > values["OUTBOUND_BACKOFF_MAX_SECONDS"]:
         raise ValueError(
             f"OUTBOUND_BACKOFF_INITIAL_SECONDS ({values['OUTBOUND_BACKOFF_INITIAL_SECONDS']}) must not exceed "

@@ -4,12 +4,15 @@ from typing import List, Optional
 
 import pydantic
 
+from app import settings
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 from .core import (
     AuthActionConfiguration,
     InternalActionConfiguration,
     PushActionConfiguration,
+    ReferenceActionConfiguration,
 )
+from .jq_editor import jq_transform_annotation
 
 # RFC 9110 field-name token.
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -135,9 +138,28 @@ class EndpointSettings(pydantic.BaseModel):
     batch_mode: bool
     max_batch_size: int
     max_wait_seconds: int
+    capture_samples: bool
 
 
 MAX_BATCH_SIZE = 10000
+
+
+def duration_text(seconds: int) -> str:
+    """'2 days', '36 hours', '90 minutes': the largest unit that divides evenly."""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}{'' if count == 1 else 's'}"
+
+
+def _capture_samples_description() -> str:
+    ttl = duration_text(settings.OUTBOUND_SAMPLES_TTL_SECONDS)
+    return (
+        f"While on, the latest {settings.OUTBOUND_SAMPLES_MAX} records of this data type, as the JQ filter "
+        f"receives them, are kept for {ttl} for use in the transformation editor. They are real data. "
+        f"Turning this off hides them at once; they are deleted when the next record of this type arrives, "
+        f"or within {ttl}."
+    )
 
 _OUTPUT_TYPE_ONE_OF = [{"const": t.value, "title": OUTPUT_TYPE_TITLES[t]} for t in OutputType]
 _URL_PATTERN = "^https://"
@@ -156,7 +178,8 @@ class Endpoint(pydantic.BaseModel):
         ui_options=UIOptions(widget="password", placeholder="https://example.com/webhooks/gundi"),
     )
     method: HttpMethod = pydantic.Field(HttpMethod.POST, title="HTTP Method")
-    jq_filter: str = FieldWithUIOptions(
+    # Its ui schema is set in DeliverConfig.ui_schema.
+    jq_filter: str = pydantic.Field(
         ".",
         title="JQ Filter",
         description=(
@@ -164,7 +187,6 @@ class Endpoint(pydantic.BaseModel):
             "No output (or null) skips the request; several outputs are sent as a JSON array. "
             "In batch mode, a filter that fails on any record drops the whole batch."
         ),
-        ui_options=UIOptions(widget="textarea", rows=4),
     )
     batch_mode: bool = pydantic.Field(
         False, title="Batch Mode", description="Send records in groups instead of one request per record.",
@@ -181,6 +203,10 @@ class Endpoint(pydantic.BaseModel):
             "Batch mode: a partial batch is sent with the next record that arrives for this integration "
             "after its oldest record has waited this long."
         ),
+    )
+
+    capture_samples: bool = pydantic.Field(
+        False, title="Capture data samples", description=_capture_samples_description(),
     )
 
     @pydantic.validator("url", pre=True)
@@ -249,9 +275,15 @@ class DeliverConfig(PushActionConfiguration):
                    if getattr(field.field_info, "ui_options", None)},
             },
         }
-        # The portal's jq editor keys off this option on a textarea. A "jq"
-        # widget name would make rjsf throw in portals that lack it.
-        base["endpoints"]["items"]["jq_filter"]["ui:options"] = {"language": "jq"}
+        # The portal's jq editor keys off ui:options.language on a textarea. A
+        # "jq" widget name would make rjsf throw in portals that lack it.
+        base["endpoints"]["items"]["jq_filter"] = {
+            "ui:widget": "textarea",
+            "ui:options": {"language": "jq", "rows": 4},
+            "gundi:jq_transform": jq_transform_annotation(
+                output_type_field="output_type", batch_field="batch_mode", samples_action="get_data_samples",
+            ),
+        }
         return base
 
 
@@ -264,3 +296,11 @@ class DeliverBatchConfig(PushActionConfiguration, InternalActionConfiguration):
     without a stored config row, which would otherwise answer 404 and leave
     Pub/Sub redelivering the bundle.
     """
+
+
+class GetDataSamplesQuery(ReferenceActionConfiguration):
+    """Recent records captured for the transformation editor (see Endpoint.capture_samples)."""
+
+    output_type: Optional[OutputType] = pydantic.Field(
+        None, title="Data Type", description="Only this data type's samples. Leave unset to return every type.",
+    )

@@ -1,5 +1,6 @@
-import json
+import asyncio
 import logging
+from time import monotonic
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,8 +24,9 @@ from app.services.errors import (
     IntegrationRateLimitError,
     format_error_message,
 )
-from app.services.jq_transform import outbound_body
+from app.services.jq_transform import jq_input, outbound_body
 from app.services.outbound_buffer import OutboundBuffer
+from app.services.outbound_samples import OutboundSamples
 from app.services.state import IntegrationStateManager
 from app.services.url_policy import URLResolutionError, validate_outbound_url
 from app.services.utils import generate_batches
@@ -35,6 +37,7 @@ from .configurations import (
     DeliverBatchConfig,
     DeliverConfig,
     EndpointSettings,
+    GetDataSamplesQuery,
     OutputType,
 )
 from .envelopes import GundiBatchDelivery
@@ -43,7 +46,14 @@ logger = logging.getLogger(__name__)
 
 outbound_buffer = OutboundBuffer()
 batch_progress = BatchProgressStore()
+outbound_samples = OutboundSamples()
 state_manager = IntegrationStateManager()
+
+# (integration_id, output_type) -> monotonic time of the last samples DEL. Capture
+# is off by default, so without it every record of every integration would DEL.
+_samples_cleared_at: Dict[Tuple[str, str], float] = {}
+_SAMPLES_CLEAR_INTERVAL_SECONDS = 60
+_SAMPLES_CLEARED_MAX_ENTRIES = 10000
 
 
 _OUTPUT_TYPES_BY_PAYLOAD = {
@@ -100,11 +110,6 @@ def _get_deliver_config(integration: Integration) -> DeliverConfig:
         return DeliverConfig.parse_obj(deliver_config.data)
     except pydantic.ValidationError:
         raise IntegrationConfigurationError("The Deliver configuration is invalid.") from None
-
-
-def _serialize(payload: pydantic.BaseModel) -> dict:
-    # Through .json() so datetimes and UUIDs become JSON values jq can read.
-    return json.loads(payload.json())
 
 
 def _failure(error_class, message: str, *, retryable: bool, status_code: Optional[int] = None,
@@ -208,6 +213,42 @@ async def _log_dropped(integration: Integration, action_id: str, payloads: List[
         level=LogLevel.INFO,
         data={"payload_types": dict(counts), "gundi_ids": [str(p.gundi_id) for p in payloads]},
     )
+
+
+async def _capture_samples(integration: Integration, endpoint: EndpointSettings, records: List[dict]):
+    """Keep the newest records as samples for the transformation editor, or
+    delete the type's samples when its endpoint has capture off (at most once
+    per _SAMPLES_CLEAR_INTERVAL_SECONDS per process).
+
+    Never raises, and gives Redis OUTBOUND_SAMPLES_TIMEOUT_SECONDS: samples are
+    a convenience, and an exception or a stall here would fail the delivery
+    and have Pub/Sub redeliver the records.
+    """
+    integration_id, output_type = str(integration.id), endpoint.output_type.value
+    cleared_key = (integration_id, output_type)
+    try:
+        if endpoint.capture_samples:
+            # So turning capture off again deletes at the next record.
+            _samples_cleared_at.pop(cleared_key, None)
+            await asyncio.wait_for(
+                outbound_samples.capture(integration_id, output_type, records),
+                timeout=settings.OUTBOUND_SAMPLES_TIMEOUT_SECONDS,
+            )
+            return
+        now = monotonic()
+        last = _samples_cleared_at.get(cleared_key)
+        if last is not None and now - last < _SAMPLES_CLEAR_INTERVAL_SECONDS:
+            return
+        await asyncio.wait_for(
+            outbound_samples.clear(integration_id, output_type), timeout=settings.OUTBOUND_SAMPLES_TIMEOUT_SECONDS,
+        )
+        if len(_samples_cleared_at) >= _SAMPLES_CLEARED_MAX_ENTRIES:
+            _samples_cleared_at.clear()
+        _samples_cleared_at[cleared_key] = now
+    except Exception as e:
+        logger.warning(
+            f"Could not update the {output_type} samples of integration '{integration_id}': {type(e).__name__}: {e}"
+        )
 
 
 async def _flush_buffer(
@@ -384,7 +425,8 @@ async def _deliver_payload(
         await _log_dropped(integration, "deliver", [payload])
         return {"dropped": True, "payload_type": type(payload).__name__}, None
 
-    record = _serialize(payload)
+    record = jq_input(payload)
+    await _capture_samples(integration, endpoint, [record])
 
     if endpoint.batch_mode:
         # Once buffered the record is ours to deliver: a failed flush below must
@@ -490,19 +532,63 @@ async def action_deliver_batch(
         if output_type not in deliver_config.output_types:
             dropped.append(payload)
             continue
-        groups.setdefault(output_type, []).append(_serialize(payload))
+        groups.setdefault(output_type, []).append(jq_input(payload))
     if dropped:
         await _log_dropped(integration, "deliver_batch", dropped)
 
     delivered = {}
     for output_type, records in groups.items():
-        delivered[output_type.value] = await _deliver_bundle_group(
-            integration, data.batch_id, deliver_config.endpoint_for(output_type), records,
-        )
+        endpoint = deliver_config.endpoint_for(output_type)
+        await _capture_samples(integration, endpoint, records)
+        delivered[output_type.value] = await _deliver_bundle_group(integration, data.batch_id, endpoint, records)
     result = {"batch_id": str(data.batch_id), "dropped": len(dropped), "delivered": delivered}
     if swept := await _sweep_buffers(integration, "deliver_batch", deliver_config):
         result["buffers"] = swept
     return result
+
+
+# No @activity_logger: the portal calls this each time the transformation
+# editor opens or refreshes, which would flood the integration's activity feed.
+async def action_get_data_samples(integration: Integration, action_config: GetDataSamplesQuery):
+    """Captured samples (newest first) and which types are capturing them.
+
+    Reference actions get no stored config, so whether capture is on is read
+    from the integration's current deliver config. Types with capture off
+    return no samples even if some are still stored: deliveries delete them
+    only when a record of the type arrives, so this also deletes them.
+    """
+    integration_id = str(integration.id)
+    try:
+        deliver_config = _get_deliver_config(integration)
+    except IntegrationConfigurationError:
+        deliver_config = None
+    capture_enabled = {}
+    for output_type in OutputType:
+        endpoint = deliver_config.endpoint_for(output_type) if deliver_config else None
+        capture_enabled[output_type.value] = bool(endpoint and endpoint.capture_samples)
+    if disabled := [name for name, enabled in capture_enabled.items() if not enabled]:
+        try:
+            await asyncio.wait_for(
+                outbound_samples.clear(integration_id, *disabled), timeout=settings.OUTBOUND_SAMPLES_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not delete the disabled samples of integration '{integration_id}': {type(e).__name__}: {e}"
+            )
+    output_types = [action_config.output_type] if action_config.output_type else list(OutputType)
+    samples = {
+        output_type.value: (
+            await outbound_samples.read(integration_id, output_type.value)
+            if capture_enabled[output_type.value] else []
+        )
+        for output_type in output_types
+    }
+    return {
+        "samples": samples,
+        "capture_enabled": capture_enabled,
+        "max_samples": settings.OUTBOUND_SAMPLES_MAX,
+        "ttl_seconds": settings.OUTBOUND_SAMPLES_TTL_SECONDS,
+    }
 
 
 async def _sweep_buffers(

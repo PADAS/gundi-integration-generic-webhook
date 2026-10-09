@@ -7,6 +7,7 @@ from gundi_core.schemas.v2 import Integration
 from app.actions import handlers
 from app.services.batch_progress import BatchProgressStore
 from app.services.outbound_buffer import OutboundBuffer
+from app.services.outbound_samples import OutboundSamples
 from app.services.tests.fake_redis import FakeRedis
 
 INTEGRATION_ID = "0f2b3c1e-6a6e-4d36-9d59-6f3c1e2b9a10"
@@ -53,7 +54,9 @@ DEFAULT_URLS = {
     "event_update": "https://hooks.example.com/event_update",
     "message": "https://hooks.example.com/message",
 }
-_ENDPOINT_FIELDS = ("url", "method", "jq_filter", "batch_mode", "max_batch_size", "max_wait_seconds")
+_ENDPOINT_FIELDS = (
+    "url", "method", "jq_filter", "batch_mode", "max_batch_size", "max_wait_seconds", "capture_samples",
+)
 
 
 def deliver_config_data(output_types=("observation", "event"), **overrides):
@@ -135,6 +138,8 @@ def outbound_env(mocker, fake_redis, published_events):
     """Handlers wired to an in-memory Redis, a mocked endpoint and a captured activity feed."""
     mocker.patch.object(handlers, "outbound_buffer", OutboundBuffer(db_client=fake_redis))
     mocker.patch.object(handlers, "batch_progress", BatchProgressStore(db_client=fake_redis))
+    mocker.patch.object(handlers, "outbound_samples", OutboundSamples(db_client=fake_redis))
+    mocker.patch.dict(handlers._samples_cleared_at, clear=True)
     state_manager = mocker.MagicMock()
     state_manager.set_if_absent = mocker.AsyncMock(side_effect=[True, False, False])
     state_manager.delete_state = mocker.AsyncMock()

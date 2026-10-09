@@ -73,9 +73,11 @@ API docs available at http://localhost:8080/docs
 | `app/actions/handlers.py` | Pull/push action handlers |
 | `app/actions/configurations.py` | Action configuration models |
 | `app/actions/client.py` | Pure HTTP client for outbound webhook endpoints (no Gundi imports) |
+| `app/actions/jq_editor.py` | Schemas + example records for the `gundi:jq_transform` ui-schema annotation on `jq_filter` |
 | `app/actions/envelopes.py` | `GundiBatchDelivery` bundle envelope (local until it moves to gundi-core) |
-| `app/services/jq_transform.py` | JQ helpers shared by the inbound webhook and outbound deliver actions |
+| `app/services/jq_transform.py` | JQ helpers shared by the inbound webhook and outbound deliver actions; `jq_input()` builds the outbound jq input |
 | `app/services/outbound_buffer.py` | Redis buffers + locked flush for outbound batch mode |
+| `app/services/outbound_samples.py` | Redis store of recent outbound jq inputs for the portal's transformation editor (`capture_samples`) |
 | `app/services/batch_progress.py` | Per-bundle redelivery dedup records (ported from the ER dispatcher) |
 | `app/services/webhooks.py` | Orchestrates webhook processing, payload parsing, error publishing |
 | `app/services/action_runner.py` | Orchestrates action execution |

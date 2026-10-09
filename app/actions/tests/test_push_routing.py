@@ -47,7 +47,7 @@ def _push(envelope):
 
 
 def test_outbound_actions_are_discovered():
-    assert set(get_actions()) == {"auth", "deliver", "deliver_batch"}
+    assert set(get_actions()) == {"auth", "deliver", "deliver_batch", "get_data_samples"}
 
 
 def test_gundi_delivery_routes_to_deliver(runner):
@@ -106,9 +106,86 @@ async def test_registration_shows_auth_and_one_deliver_form(mocker):
     await register_integration_in_gundi(gundi_client=gundi_client)
 
     actions = {a["value"]: a for a in gundi_client.register_integration_type.call_args.args[0]["actions"]}
-    assert set(actions) == {"auth", "deliver"}
+    assert set(actions) == {"auth", "deliver", "get_data_samples"}
     assert (actions["auth"]["type"], actions["deliver"]["type"]) == ("auth", "push")
+    # The portal hides reference actions from the configuration sections.
+    assert actions["get_data_samples"]["type"] == "reference"
     # No pull action: the type must not look like a data source, and nothing runs on a schedule.
     assert not any(action["is_periodic_action"] for action in actions.values())
     # No always-green "Test Connection".
     assert "is_executable" not in actions["auth"]["schema"]
+
+
+def test_get_data_samples_through_the_execute_endpoint(runner):
+    # cdip's POST /v2/integrations/{id}/actions/get_data_samples/execute/ forwards
+    # here and returns this body unchanged, so the portal reads body["samples"].
+    _, config_manager, runner_events = runner
+    _push(GundiDelivery(payload=event(1), provider=PROVIDER))  # capture is off: nothing stored
+
+    response = api_client.post("/v1/actions/execute", json={
+        "integration_id": INTEGRATION_ID, "action_id": "get_data_samples",
+        "config_overrides": {"output_type": "event"},
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "samples": {"event": []},
+        "capture_enabled": {"observation": False, "event": False, "event_update": False, "message": False},
+        "max_samples": 3,
+        "ttl_seconds": 172800,
+    }
+    # Reference action: no stored row is looked up for it.
+    assert all(call.args[1] != "get_data_samples" for call in config_manager.get_action_configuration.call_args_list)
+
+
+def test_captured_samples_are_returned_by_the_execute_endpoint(mocker, outbound_env):
+    data = deliver_config_data(event_capture_samples=True)
+    integration = make_integration(deliver=data, auth=AUTH_CONFIG_DATA)
+    config_manager = mocker.MagicMock()
+    config_manager.get_integration_details.return_value = async_return(integration)
+    config_manager.get_action_configuration.side_effect = lambda integration_id, action_id: async_return(
+        integration.get_action_config(action_id)
+    )
+    mocker.patch("app.services.action_runner.config_manager", config_manager)
+    mocker.patch("app.services.action_runner.publish_event", mocker.AsyncMock())
+    _push(GundiDelivery(payload=event(1), provider=PROVIDER))
+    _push(GundiDelivery(payload=event(2), provider=PROVIDER))
+
+    body = api_client.post("/v1/actions/execute", json={
+        "integration_id": INTEGRATION_ID, "action_id": "get_data_samples",
+    }).json()
+
+    assert set(body["samples"]) == {"observation", "event", "event_update", "message"}
+    assert [s["record"]["title"] for s in body["samples"]["event"]] == ["Sighting 2", "Sighting 1"]
+    assert body["samples"]["observation"] == []
+    assert body["capture_enabled"]["event"] is True
+
+
+def test_get_data_samples_for_a_draft_integration(mocker, outbound_env, fake_redis):
+    # A draft run gets a fresh integration id, so no saved integration's samples can leak into it.
+    mocker.patch("app.services.action_runner.publish_event", mocker.AsyncMock())
+    fake_redis.lists[f"outbound_samples.{INTEGRATION_ID}.event"] = [b'{"captured_at": "x", "record": {}}']
+
+    response = api_client.post("/v1/actions/execute", json={
+        "action_id": "get_data_samples",
+        "integration_state": {
+            "type_value": "generic_webhook",
+            "configurations": [{"action_value": "deliver", "data": deliver_config_data(event_capture_samples=True)}],
+        },
+    })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["samples"] == {"observation": [], "event": [], "event_update": [], "message": []}
+    assert body["capture_enabled"] == {"observation": False, "event": True, "event_update": False, "message": False}
+    assert fake_redis.lists[f"outbound_samples.{INTEGRATION_ID}.event"]
+
+
+def test_get_data_samples_rejects_an_unknown_data_type(runner):
+    response = api_client.post("/v1/actions/execute", json={
+        "integration_id": INTEGRATION_ID, "action_id": "get_data_samples",
+        "config_overrides": {"output_type": "bogus"},
+    })
+
+    assert response.status_code == 422
+    assert "output_type" in response.text

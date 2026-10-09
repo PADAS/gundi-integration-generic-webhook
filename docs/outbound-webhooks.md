@@ -15,11 +15,13 @@ the user configures. It needs the destination integration to have
 | `auth` | auth | portal | API key and custom headers sent on every request |
 | `deliver` | push | `GundiDelivery` | Delivers one payload (or buffers it in batch mode) |
 | `deliver_batch` | push, internal | `GundiBatchDelivery` | Delivers a bundle. Uses the `deliver` config; not registered, so no form of its own |
+| `get_data_samples` | reference | portal (on demand) | Returns the captured data samples for the transformation editor (see [Data samples](#data-samples-for-the-transformation-editor)) |
 
 Code: `app/actions/handlers.py`, models in `app/actions/configurations.py`,
 HTTP client in `app/actions/client.py`, bundle envelope in
-`app/actions/envelopes.py`, and in `app/services/`: `jq_transform.py`,
-`outbound_buffer.py` and `batch_progress.py`.
+`app/actions/envelopes.py`, jq editor annotation in `app/actions/jq_editor.py`,
+and in `app/services/`: `jq_transform.py`, `outbound_buffer.py`,
+`outbound_samples.py` and `batch_progress.py`.
 
 There is no scheduled action: buffers are flushed inline by the deliveries
 (see [Batch mode](#batch-mode-deliver--buffer)). A scheduled action would not
@@ -30,7 +32,8 @@ look like a data source in the portal.
 
 `deliver` and `deliver_batch` publish activity events on **errors only**.
 cdip-routing sends one `GundiDelivery` per record, so started/completed
-events would add two feed entries per record.
+events would add two feed entries per record. `get_data_samples` publishes
+none: the portal calls it whenever the editor opens or refreshes.
 
 ## Configuration
 
@@ -73,6 +76,8 @@ events would add two feed entries per record.
   - `jq_filter`: default `.`.
   - `batch_mode` (default off), `max_batch_size` (default 100, ≥ 1),
     `max_wait_seconds` (default 60, ≥ 60).
+  - `capture_samples` (default off): keep recent records for the
+    transformation editor (see [Data samples](#data-samples-for-the-transformation-editor)).
 
   The list renders like `custom_headers`: an Add button, with an explicit
   `ui:order` inside the items.
@@ -89,6 +94,10 @@ Settings (`app/settings/integration.py`):
 | `OUTBOUND_BACKOFF_INITIAL_SECONDS` | 30 |
 | `OUTBOUND_BACKOFF_MAX_SECONDS` | 900; must be ≥ the initial backoff |
 | `OUTBOUND_OVERFLOW_REPORT_SECONDS` | 600: buffer-overflow ERRORs at most this often |
+| `OUTBOUND_SAMPLES_MAX` | 3: data samples kept per data type |
+| `OUTBOUND_SAMPLES_TTL_SECONDS` | 172800 (2 days) after the last capture |
+| `OUTBOUND_SAMPLE_MAX_BYTES` | 65536: a larger stored entry (record plus capture time) is not captured |
+| `OUTBOUND_SAMPLES_TIMEOUT_SECONDS` | 1: longest a capture or delete may hold up a delivery |
 
 Every count and duration must be a positive integer, and the timeout a
 positive number. `validate_outbound_settings` checks them at import, together
@@ -115,6 +124,113 @@ filter runs on the whole chunk, so a runtime error caused by one malformed
 record drops the whole chunk** (logged with every `gundi_id`). Write batch
 filters defensively, e.g. `map(.x | tonumber? // null)`. Line breaks are
 removed before the filter runs, as the inbound webhook always did.
+
+## The transformation editor contract
+
+`DeliverConfig.ui_schema()` gives the portal what its jq editor (Schema &
+example, Transformations, Preview) needs, on `endpoints.items.jq_filter`:
+
+```json
+{
+  "ui:widget": "textarea",
+  "ui:options": {"language": "jq", "rows": 4},
+  "gundi:jq_transform": {
+    "output_type_field": "output_type",
+    "batch_field": "batch_mode",
+    "samples_action": "get_data_samples",
+    "schemas":  {"observation": {}, "event": {}, "event_update": {}, "message": {}},
+    "examples": {"observation": {}, "event": {}, "event_update": {}, "message": {}}
+  }
+}
+```
+
+- `output_type_field` and `batch_field` name the sibling fields that choose
+  the schema/example and whether the filter's input is one record or an array.
+- `schemas` are the pinned gundi-core models' `.schema()` (`Observation`,
+  `Event`, `EventUpdate`, `TextMessage`).
+- `examples` are built from those models, using gundi-core's example values
+  where it has them. They are serialized with `jq_input`
+  (`app/services/jq_transform.py`), the same function that builds the
+  deliver actions' jq input, so they have exactly the shape a filter receives.
+  In batch mode the editor wraps them in an array.
+- `samples_action` is the reference action that returns real captured
+  records (below).
+- The annotation is about 12 KB (a test keeps the whole ui schema under
+  40 KB). It reaches the portal through self-registration, so a gundi-core
+  bump changes it on the next deploy.
+
+The portal must ignore the `gundi:` key in other rjsf contexts; rjsf itself
+ignores keys it does not know.
+
+## Data samples for the transformation editor
+
+With `capture_samples` on, an endpoint keeps the latest records of its data
+type, **as the jq filter receives them** (after `apply_transformations`,
+serialized with `jq_input`), so the editor can preview a filter against real
+data.
+
+- **When**: at the point where the jq input is built, before buffering or
+  sending, in `deliver` (single and batch mode) and `deliver_batch`. A record
+  is captured even if its delivery then fails.
+- **Storage**: Redis list `outbound_samples.{integration_id}.{output_type}`,
+  newest first. Each entry is `{"captured_at": "<ISO-8601 UTC>", "record": {...}}`.
+  One `MULTI` pipeline does `LPUSH`, `LTRIM` to `OUTBOUND_SAMPLES_MAX`, and
+  `EXPIRE` `OUTBOUND_SAMPLES_TTL_SECONDS`. A bundle pushes only its newest
+  `OUTBOUND_SAMPLES_MAX` records per type: the trim would discard the rest.
+  Entries over `OUTBOUND_SAMPLE_MAX_BYTES` are skipped (debug log).
+- **Turning it off** (or removing the endpoint): `get_data_samples` stops
+  returning that type's samples at once, and deletes them when called.
+  Deliveries delete them too: a record of a type whose endpoint has capture
+  off issues a `DEL`, at most once a minute per (integration, type) per
+  runner instance, so the default (off) does not add a Redis round trip to
+  every record. Otherwise they expire with the TTL. Types without an
+  endpoint are never captured. The field description, built from the
+  settings, says this.
+- **Never fails or stalls a delivery**: a capture or delete gets
+  `OUTBOUND_SAMPLES_TIMEOUT_SECONDS`. A failure or a timeout is logged at
+  WARNING and the delivery goes on.
+- **Duplicates**: a Pub/Sub redelivery captures the same record again.
+
+**Privacy**: samples are real data (locations, sensor readings, message
+text) copied into Redis, outside the delivery path. That is why capture is
+off by default and per data type, the field's description says so, the list
+is short, and the TTL is short. They can be read through `get_data_samples`
+by whoever may execute the integration's actions in cdip: superusers and
+admins of the integration's organization (viewers cannot POST to the execute
+endpoint). Turn capture off when the transformation is done.
+
+`get_data_samples` returns tenant data, and the runner's `/v1/actions/execute`
+has no app-level auth: the runner's Cloud Run service must stay restricted by
+IAM or ingress so that only cdip and Pub/Sub can call it.
+
+### `get_data_samples` (reference action)
+
+Executed through cdip's
+`POST /v2/integrations/{id}/actions/get_data_samples/execute/` with optional
+`config_overrides: {"output_type": "event"}`. Like every reference action,
+it is registered with type `reference` (hidden from config sections), runs
+without a stored config row, and needs no activity logging. It returns:
+
+```json
+{"samples": {"event": [{"captured_at": "...", "record": {}}]},
+ "capture_enabled": {"observation": false, "event": true, "event_update": false, "message": false},
+ "max_samples": 3, "ttl_seconds": 172800}
+```
+
+- `samples`: newest first. Only the requested type when `output_type` is
+  given, otherwise all four (empty lists when there are none).
+- `capture_enabled`: all four types, from the integration's current deliver
+  config. `false` for a type with no endpoint, or when the config is missing
+  or invalid. A type with `false` always has `[]` samples.
+- A draft (ephemeral) run gets a fresh integration id, so it returns no
+  samples; `capture_enabled` reflects the draft's deliver config.
+- An unknown `output_type` is rejected with 422.
+- **Response body**: the runner returns the handler's dict as the HTTP body
+  unchanged (`execute_action` returns `result` as is), and cdip's
+  `ActionTriggerView.execute` returns the runner's JSON as is. Read
+  `body.samples`, not `body.result.samples`. Errors are not passed through:
+  cdip calls `raise_for_status()` on the runner's answer, so a runner error
+  surfaces as a cdip error rather than the runner's `{"detail": ...}` body.
 
 ## Delivery and failure handling
 
@@ -279,8 +395,8 @@ the redelivered bundle resumes at the failed request. Records expire after
 - **DNS rebinding (TOCTOU)**: the URL is resolved and checked, then httpx
   resolves it again to connect. Closing this needs a transport pinned to the
   checked address, or egress restrictions at the infrastructure level.
-- **Module placement**: `jq_transform`, `outbound_buffer` and `batch_progress`
-  are new files under the template's `app/services/`. They are additive, so
+- **Module placement**: `jq_transform`, `outbound_buffer`, `outbound_samples`
+  and `batch_progress` are new files under the template's `app/services/`. They are additive, so
   merge risk is low, but connector-specific code would normally live in
   `app/actions/`.
 - **No connection reuse**: every request opens a new HTTP client, so a
